@@ -1497,7 +1497,12 @@ async function requestHandler(req, res) {
           <p>You can close this tab and return to Figma.</p></div></body></html>`);
       } catch (err) {
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<p>Authorization failed: ' + (err.message || 'Unknown error') + '. Please try again.</p>');
+        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Design Guardian</title>
+          <style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0d0d0d;color:#e5e5e5;}
+          .card{text-align:center;padding:40px;border-radius:12px;background:#1a1a1a;border:1px solid #2a2a2a;}
+          h2{margin:0 0 8px;font-size:18px;}p{margin:0;color:#888;font-size:14px;}</style>
+          </head><body><div class="card"><h2>Connection failed</h2>
+          <p>Something went wrong. Close this tab and try again in Figma.</p></div></body></html>`);
       }
       return;
     }
