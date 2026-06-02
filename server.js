@@ -1454,6 +1454,7 @@ async function requestHandler(req, res) {
       authUrl.searchParams.set('scope', 'current_user:read file_content:read file_metadata:read library_assets:read library_content:read team_library_content:read');
       authUrl.searchParams.set('state', state);
       authUrl.searchParams.set('response_type', 'code');
+      console.log('[oauth /auth/figma] redirecting to:', authUrl.toString());
       res.writeHead(302, { Location: authUrl.toString() });
       res.end();
       return;
