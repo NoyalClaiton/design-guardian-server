@@ -1064,6 +1064,7 @@ async function requestHandler(req, res) {
 
   try {
     const url = new URL(req.url, `http://localhost:${PORT}`);
+    console.log('[req]', req.method, url.pathname);
 
     if (req.method === 'GET' && url.pathname === '/health') {
       sendJson(res, 200, {
