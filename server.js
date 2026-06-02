@@ -24,7 +24,10 @@ const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
 // ── User store (fs + in-memory Maps, no native dependencies) ─────────────────
 // users: persisted to a JSON file. Two Maps for O(1) lookup by id or figmaUserId.
 // pending_auth: in-memory only (10-min TTL, no persistence needed).
-const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
+// On Railway, default to /data/users.json (volume mount point).
+// Locally, fall back to users.json next to server.js.
+const USERS_FILE = process.env.USERS_FILE ||
+  (process.env.RAILWAY_ENVIRONMENT ? '/data/users.json' : path.join(__dirname, 'users.json'));
 
 let _nextUserId = 1;
 const _usersByFigmaId = new Map();
@@ -42,6 +45,7 @@ const _usersById = new Map();
 })();
 
 function saveUsers() {
+  fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
   fs.writeFileSync(USERS_FILE, JSON.stringify({
     nextId: _nextUserId,
     users: Array.from(_usersByFigmaId.values())
