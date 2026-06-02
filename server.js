@@ -14,6 +14,7 @@ const FIGMA_PAT = process.env.FIGMA_PAT;
 // ── OAuth / Cloud auth config ────────────────────────────────────────────────
 const FIGMA_CLIENT_ID = process.env.FIGMA_CLIENT_ID || '';
 const FIGMA_CLIENT_SECRET = process.env.FIGMA_CLIENT_SECRET || '';
+console.log('[config] FIGMA_CLIENT_ID:', FIGMA_CLIENT_ID ? 'set (' + FIGMA_CLIENT_ID.length + ' chars)' : 'MISSING');
 const FIGMA_REDIRECT_URI = process.env.FIGMA_REDIRECT_URI || `http://localhost:${PORT}/auth/figma/callback`;
 const JWT_SECRET = process.env.JWT_SECRET || '';
 // 32-byte hex key for AES-256-GCM token encryption
