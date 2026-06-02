@@ -1,5 +1,5 @@
 .env
 node_modules/
-*.db
+users.json
 *.pem
 .DS_Store

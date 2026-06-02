@@ -7,8 +7,6 @@ const path = require('path');
 const { URL } = require('url');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
-const archiver = require('archiver');
 
 const PORT = process.env.PORT || 3001;
 const FIGMA_PAT = process.env.FIGMA_PAT;
@@ -23,29 +21,75 @@ const TOKEN_ENC_KEY = process.env.TOKEN_ENCRYPTION_KEY ? Buffer.from(process.env
 // Pending auth states expire after 10 minutes
 const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
 
-// ── SQLite database ──────────────────────────────────────────────────────────
-// users: one row per Figma account, stores encrypted OAuth tokens.
-// pending_auth: short-lived state->JWT map for the plugin polling pattern.
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'design-guardian.db');
-const db = new Database(DB_PATH);
+// ── User store (fs + in-memory Maps, no native dependencies) ─────────────────
+// users: persisted to a JSON file. Two Maps for O(1) lookup by id or figmaUserId.
+// pending_auth: in-memory only (10-min TTL, no persistence needed).
+const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    figma_user_id TEXT UNIQUE NOT NULL,
-    figma_handle TEXT,
-    figma_email TEXT,
-    access_token TEXT NOT NULL,
-    refresh_token TEXT NOT NULL,
-    token_expires_at INTEGER,
-    created_at INTEGER DEFAULT (strftime('%s', 'now'))
-  );
-  CREATE TABLE IF NOT EXISTS pending_auth (
-    state TEXT PRIMARY KEY,
-    jwt TEXT,
-    created_at INTEGER DEFAULT (strftime('%s', 'now'))
-  );
-`);
+let _nextUserId = 1;
+const _usersByFigmaId = new Map();
+const _usersById = new Map();
+
+(function loadUsers() {
+  try {
+    const data = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    _nextUserId = data.nextId || 1;
+    (data.users || []).forEach(function(u) {
+      _usersByFigmaId.set(u.figmaUserId, u);
+      _usersById.set(u.id, u);
+    });
+  } catch (_) {}
+})();
+
+function saveUsers() {
+  fs.writeFileSync(USERS_FILE, JSON.stringify({
+    nextId: _nextUserId,
+    users: Array.from(_usersByFigmaId.values())
+  }, null, 2));
+}
+
+function upsertUser(figmaUserId, figmaHandle, figmaEmail, accessToken, refreshToken, tokenExpiresAt) {
+  let user = _usersByFigmaId.get(figmaUserId);
+  if (user) {
+    user.figmaHandle = figmaHandle;
+    user.figmaEmail = figmaEmail;
+    user.accessToken = accessToken;
+    user.refreshToken = refreshToken;
+    user.tokenExpiresAt = tokenExpiresAt;
+  } else {
+    user = { id: _nextUserId++, figmaUserId, figmaHandle, figmaEmail, accessToken, refreshToken, tokenExpiresAt, createdAt: Math.floor(Date.now() / 1000) };
+    _usersByFigmaId.set(figmaUserId, user);
+    _usersById.set(user.id, user);
+  }
+  saveUsers();
+  return user;
+}
+
+function getUserById(id) {
+  return _usersById.get(parseInt(id)) || null;
+}
+
+function updateUserToken(id, accessToken, tokenExpiresAt) {
+  const user = _usersById.get(parseInt(id));
+  if (!user) return;
+  user.accessToken = accessToken;
+  user.tokenExpiresAt = tokenExpiresAt;
+  saveUsers();
+}
+
+const _pendingAuth = new Map();
+
+function setPendingAuth(state, jwtToken) {
+  _pendingAuth.set(state, { jwt: jwtToken, createdAt: Date.now() });
+}
+
+function getPendingAuth(state) {
+  return _pendingAuth.get(state) || null;
+}
+
+function deletePendingAuth(state) {
+  _pendingAuth.delete(state);
+}
 
 // ── Token encryption helpers ─────────────────────────────────────────────────
 // AES-256-GCM: produces iv:authTag:ciphertext (all hex, colon-separated).
@@ -78,7 +122,7 @@ function getUserFromRequest(req) {
   if (!auth.startsWith('Bearer ')) return null;
   try {
     const payload = jwt.verify(auth.slice(7), JWT_SECRET);
-    return db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub);
+    return getUserById(payload.sub);
   } catch (_) {
     return null;
   }
@@ -90,11 +134,11 @@ function getUserFromRequest(req) {
 async function getFigmaToken(user) {
   const TEN_MIN = 10 * 60;
   const nowSec = Math.floor(Date.now() / 1000);
-  if (user.token_expires_at && user.token_expires_at - nowSec > TEN_MIN) {
-    return decryptToken(user.access_token);
+  if (user.tokenExpiresAt && user.tokenExpiresAt - nowSec > TEN_MIN) {
+    return decryptToken(user.accessToken);
   }
   // Refresh
-  const refreshToken = decryptToken(user.refresh_token);
+  const refreshToken = decryptToken(user.refreshToken);
   const body = new URLSearchParams({
     client_id: FIGMA_CLIENT_ID,
     client_secret: FIGMA_CLIENT_SECRET,
@@ -108,9 +152,7 @@ async function getFigmaToken(user) {
     body: body.toString(),
   });
   const expiresAt = Math.floor(Date.now() / 1000) + (resp.expires_in || 7776000);
-  db.prepare(`
-    UPDATE users SET access_token = ?, token_expires_at = ? WHERE id = ?
-  `).run(encryptToken(resp.access_token), expiresAt, user.id);
+  updateUserToken(user.id, encryptToken(resp.access_token), expiresAt);
   return resp.access_token;
 }
 
@@ -1027,35 +1069,6 @@ async function requestHandler(req, res) {
       return;
     }
 
-    // GET /download — streams a ZIP of the server source files.
-    // Excludes node_modules, .env, .db files, and the ZIP itself so the
-    // recipient gets a clean copy they can configure and run independently.
-    if (req.method === 'GET' && url.pathname === '/download') {
-      const archive = archiver('zip', { zlib: { level: 6 } });
-      res.writeHead(200, {
-        'Content-Type': 'application/zip',
-        'Content-Disposition': 'attachment; filename="design-guardian-server.zip"',
-        'Access-Control-Allow-Origin': '*'
-      });
-      archive.pipe(res);
-      const root = __dirname;
-      const skip = new Set(['.env', 'node_modules', '.git', 'design-guardian.db']);
-      const entries = fs.readdirSync(root);
-      for (const entry of entries) {
-        if (skip.has(entry)) continue;
-        const fullPath = path.join(root, entry);
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          archive.directory(fullPath, entry);
-        } else {
-          archive.file(fullPath, { name: entry });
-        }
-      }
-      archive.on('error', function(err) { console.error('[DG] /download archive error:', err); });
-      archive.finalize();
-      return;
-    }
-
     if (req.method === 'GET' && url.pathname === '/library/status') {
       const requestReceivedTime = Date.now();
       const fileKey = url.searchParams.get('fileKey');
@@ -1473,21 +1486,10 @@ async function requestHandler(req, res) {
         const figmaHandle = meResp.handle || meResp.email || figmaUserId;
         const figmaEmail = meResp.email || null;
         const expiresAt = Math.floor(Date.now() / 1000) + (tokenResp.expires_in || 7776000);
-        // Upsert user
-        db.prepare(`
-          INSERT INTO users (figma_user_id, figma_handle, figma_email, access_token, refresh_token, token_expires_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(figma_user_id) DO UPDATE SET
-            figma_handle = excluded.figma_handle,
-            figma_email = excluded.figma_email,
-            access_token = excluded.access_token,
-            refresh_token = excluded.refresh_token,
-            token_expires_at = excluded.token_expires_at
-        `).run(figmaUserId, figmaHandle, figmaEmail, encryptToken(tokenResp.access_token), encryptToken(tokenResp.refresh_token), expiresAt);
-        const user = db.prepare('SELECT id FROM users WHERE figma_user_id = ?').get(figmaUserId);
+        // Upsert user and store JWT so the plugin can pick it up via polling
+        const user = upsertUser(figmaUserId, figmaHandle, figmaEmail, encryptToken(tokenResp.access_token), encryptToken(tokenResp.refresh_token), expiresAt);
         const token = signJwt(user.id);
-        // Store JWT so the plugin can pick it up via polling
-        db.prepare('INSERT OR REPLACE INTO pending_auth (state, jwt) VALUES (?, ?)').run(state, token);
+        setPendingAuth(state, token);
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Design Guardian</title>
           <style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0d0d0d;color:#e5e5e5;}
@@ -1513,14 +1515,14 @@ async function requestHandler(req, res) {
     if (req.method === 'GET' && url.pathname === '/auth/poll') {
       const state = url.searchParams.get('state');
       if (!state) { sendJson(res, 400, { error: 'Missing state' }); return; }
-      const row = db.prepare('SELECT jwt, created_at FROM pending_auth WHERE state = ?').get(state);
+      const row = getPendingAuth(state);
       if (!row) {
         sendJson(res, 410, { error: 'State expired or not found' });
         return;
       }
-      const age = Date.now() - row.created_at * 1000;
+      const age = Date.now() - row.createdAt;
       if (age > PENDING_AUTH_TTL_MS) {
-        db.prepare('DELETE FROM pending_auth WHERE state = ?').run(state);
+        deletePendingAuth(state);
         sendJson(res, 410, { error: 'State expired' });
         return;
       }
@@ -1529,7 +1531,7 @@ async function requestHandler(req, res) {
         return;
       }
       // JWT ready - return it and clean up
-      db.prepare('DELETE FROM pending_auth WHERE state = ?').run(state);
+      deletePendingAuth(state);
       sendJson(res, 200, { token: row.jwt });
       return;
     }
@@ -1540,9 +1542,9 @@ async function requestHandler(req, res) {
       const user = getUserFromRequest(req);
       if (!user) { sendJson(res, 401, { error: 'Unauthorized' }); return; }
       sendJson(res, 200, {
-        figmaUserId: user.figma_user_id,
-        handle: user.figma_handle,
-        email: user.figma_email,
+        figmaUserId: user.figmaUserId,
+        handle: user.figmaHandle,
+        email: user.figmaEmail,
       });
       return;
     }
