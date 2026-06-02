@@ -18,9 +18,6 @@ const FIGMA_REDIRECT_URI = process.env.FIGMA_REDIRECT_URI || `http://localhost:$
 const JWT_SECRET = process.env.JWT_SECRET || '';
 // 32-byte hex key for AES-256-GCM token encryption
 const TOKEN_ENC_KEY = process.env.TOKEN_ENCRYPTION_KEY ? Buffer.from(process.env.TOKEN_ENCRYPTION_KEY, 'hex') : null;
-console.log('[config] FIGMA_CLIENT_ID:', FIGMA_CLIENT_ID ? 'set (' + FIGMA_CLIENT_ID.length + ' chars)' : 'MISSING');
-console.log('[config] JWT_SECRET:', JWT_SECRET ? 'set (' + JWT_SECRET.length + ' chars)' : 'MISSING');
-console.log('[config] TOKEN_ENC_KEY:', TOKEN_ENC_KEY ? 'set (' + TOKEN_ENC_KEY.length + ' bytes)' : 'MISSING');
 // Pending auth states expire after 10 minutes
 const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
 
@@ -1067,7 +1064,6 @@ async function requestHandler(req, res) {
 
   try {
     const url = new URL(req.url, `http://localhost:${PORT}`);
-    console.log('[req]', req.method, url.pathname);
 
     if (req.method === 'GET' && url.pathname === '/health') {
       sendJson(res, 200, {
@@ -1465,7 +1461,6 @@ async function requestHandler(req, res) {
     // Step 2: Figma redirects here after user authorizes.
     // Exchanges code for tokens, upserts user, stores JWT keyed by state.
     if (req.method === 'GET' && url.pathname === '/auth/figma/callback') {
-      console.log('[callback] route matched, code=' + url.searchParams.get('code') + ' state=' + url.searchParams.get('state'));
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
       if (!code || !state) {
