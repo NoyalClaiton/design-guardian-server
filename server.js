@@ -15,6 +15,7 @@ const FIGMA_PAT = process.env.FIGMA_PAT;
 const FIGMA_CLIENT_ID = process.env.FIGMA_CLIENT_ID || '';
 const FIGMA_CLIENT_SECRET = process.env.FIGMA_CLIENT_SECRET || '';
 const FIGMA_REDIRECT_URI = process.env.FIGMA_REDIRECT_URI || `http://localhost:${PORT}/auth/figma/callback`;
+console.log('[oauth] FIGMA_CLIENT_ID length=' + FIGMA_CLIENT_ID.length + ' chars=[' + Array.from(FIGMA_CLIENT_ID).map(c => c.charCodeAt(0)).join(',') + ']');
 const JWT_SECRET = process.env.JWT_SECRET || '';
 // 32-byte hex key for AES-256-GCM token encryption
 const TOKEN_ENC_KEY = process.env.TOKEN_ENCRYPTION_KEY ? Buffer.from(process.env.TOKEN_ENCRYPTION_KEY, 'hex') : null;
