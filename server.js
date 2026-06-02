@@ -1462,6 +1462,7 @@ async function requestHandler(req, res) {
     // Step 2: Figma redirects here after user authorizes.
     // Exchanges code for tokens, upserts user, stores JWT keyed by state.
     if (req.method === 'GET' && url.pathname === '/auth/figma/callback') {
+      console.log('[callback] route matched, code=' + url.searchParams.get('code') + ' state=' + url.searchParams.get('state'));
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
       if (!code || !state) {
