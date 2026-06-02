@@ -315,7 +315,7 @@ async function fetchJson(url, options = {}) {
     }
 
     if (!response.ok) {
-      throw new Error(json?.err || json?.message || `HTTP ${response.status}`);
+      throw new Error(json?.err || json?.message || json?.error || `HTTP ${response.status}: ${JSON.stringify(json)}`);
     }
 
     return json;
