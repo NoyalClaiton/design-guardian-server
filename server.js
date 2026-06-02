@@ -1464,6 +1464,14 @@ async function requestHandler(req, res) {
     if (req.method === 'GET' && url.pathname === '/auth/figma/callback') {
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
+      const oauthError = url.searchParams.get('error');
+      const oauthErrorDesc = url.searchParams.get('error_description');
+      if (oauthError) {
+        console.error('[OAuth callback] Figma returned error:', oauthError, oauthErrorDesc);
+        res.writeHead(400, { 'Content-Type': 'text/html' });
+        res.end('<p>Authorization failed: ' + oauthError + (oauthErrorDesc ? ' - ' + oauthErrorDesc : '') + '. You can close this tab.</p>');
+        return;
+      }
       if (!code || !state) {
         res.writeHead(400, { 'Content-Type': 'text/html' });
         res.end('<p>Authorization failed. Missing code or state. You can close this tab.</p>');
@@ -1510,7 +1518,7 @@ async function requestHandler(req, res) {
           .card{text-align:center;padding:40px;border-radius:12px;background:#1a1a1a;border:1px solid #2a2a2a;}
           h2{margin:0 0 8px;font-size:18px;}p{margin:0;color:#888;font-size:14px;}</style>
           </head><body><div class="card"><h2>Connection failed</h2>
-          <p>Something went wrong. Close this tab and try again in Figma.</p></div></body></html>`);
+          <p>${err.message}</p></div></body></html>`);
       }
       return;
     }
