@@ -1502,6 +1502,7 @@ async function requestHandler(req, res) {
           </head><body><div class="card"><h2>Connected to Design Guardian</h2>
           <p>You can close this tab and return to Figma.</p></div></body></html>`);
       } catch (err) {
+        console.error('[OAuth callback error]', err.message, err.stack);
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Design Guardian</title>
           <style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0d0d0d;color:#e5e5e5;}
