@@ -15,8 +15,6 @@ const FIGMA_PAT = process.env.FIGMA_PAT;
 const FIGMA_CLIENT_ID = process.env.FIGMA_CLIENT_ID || '';
 const FIGMA_CLIENT_SECRET = process.env.FIGMA_CLIENT_SECRET || '';
 const FIGMA_REDIRECT_URI = process.env.FIGMA_REDIRECT_URI || `http://localhost:${PORT}/auth/figma/callback`;
-console.log('[oauth] FIGMA_CLIENT_ID length=' + FIGMA_CLIENT_ID.length + ' chars=[' + Array.from(FIGMA_CLIENT_ID).map(c => c.charCodeAt(0)).join(',') + ']');
-console.log('[oauth] FIGMA_REDIRECT_URI=[' + FIGMA_REDIRECT_URI + ']');
 const JWT_SECRET = process.env.JWT_SECRET || '';
 // 32-byte hex key for AES-256-GCM token encryption
 const TOKEN_ENC_KEY = process.env.TOKEN_ENCRYPTION_KEY ? Buffer.from(process.env.TOKEN_ENCRYPTION_KEY, 'hex') : null;
@@ -1451,10 +1449,9 @@ async function requestHandler(req, res) {
       const authUrl = new URL('https://www.figma.com/oauth');
       authUrl.searchParams.set('client_id', FIGMA_CLIENT_ID);
       authUrl.searchParams.set('redirect_uri', FIGMA_REDIRECT_URI);
-      authUrl.searchParams.set('scope', 'current_user:read file_content:read');
+      authUrl.searchParams.set('scope', 'current_user:read file_content:read file_metadata:read library_assets:read library_content:read team_library_content:read');
       authUrl.searchParams.set('state', state);
       authUrl.searchParams.set('response_type', 'code');
-      console.log('[oauth /auth/figma] redirecting to:', authUrl.toString());
       res.writeHead(302, { Location: authUrl.toString() });
       res.end();
       return;
