@@ -1451,7 +1451,7 @@ async function requestHandler(req, res) {
       const authUrl = new URL('https://www.figma.com/oauth');
       authUrl.searchParams.set('client_id', FIGMA_CLIENT_ID);
       authUrl.searchParams.set('redirect_uri', FIGMA_REDIRECT_URI);
-      authUrl.searchParams.set('scope', 'current_user:read file_content:read file_metadata:read library_assets:read library_content:read team_library_content:read');
+      authUrl.searchParams.set('scope', 'current_user:read file_content:read');
       authUrl.searchParams.set('state', state);
       authUrl.searchParams.set('response_type', 'code');
       console.log('[oauth /auth/figma] redirecting to:', authUrl.toString());
