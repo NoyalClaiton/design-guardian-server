@@ -1,6 +1,6 @@
 # Design Guardian: Server
 
-Backend server for the Design Guardian Figma plugin. Handles Figma library syncing, component verification, and cloud authentication.
+Backend server for the Design Guardian Figma plugin. Handles Figma library syncing and component verification.
 
 ---
 
@@ -9,8 +9,6 @@ Backend server for the Design Guardian Figma plugin. Handles Figma library synci
 - Syncs Figma library components, styles, and variables via the Figma REST API
 - Caches library data so the plugin can run fast, offline-tolerant scans
 - Verifies component approval against configured design system libraries
-- Handles Figma OAuth 2.0 for cloud mode authentication
-- Issues signed JWTs so the plugin can make authenticated requests
 
 ---
 
@@ -18,7 +16,6 @@ Backend server for the Design Guardian Figma plugin. Handles Figma library synci
 
 - Node.js 20+
 - A Figma Personal Access Token (PAT) with read access to your libraries
-- (Optional) Figma OAuth app credentials for cloud mode sign-in
 
 ---
 
@@ -33,15 +30,7 @@ npm install
 Create a `.env` file:
 
 ```env
-# Required
 FIGMA_PAT=your_figma_personal_access_token
-
-# Required only for cloud OAuth mode
-JWT_SECRET=any_long_random_string
-TOKEN_ENCRYPTION_KEY=64_char_hex_string_for_aes256
-FIGMA_CLIENT_ID=your_oauth_client_id
-FIGMA_CLIENT_SECRET=your_oauth_client_secret
-FIGMA_REDIRECT_URI=http://localhost:3001/auth/figma/callback
 ```
 
 ```bash
@@ -67,7 +56,7 @@ docker run -p 3001:3001 \
 
 1. Fork this repo
 2. Create a new Railway project from your fork
-3. Set the environment variables in the Railway dashboard (see table below)
+3. Add `FIGMA_PAT` in the Railway dashboard under Variables
 4. Railway will build and deploy automatically using the Dockerfile
 
 ---
@@ -78,11 +67,6 @@ docker run -p 3001:3001 \
 |---|---|---|
 | `FIGMA_PAT` | Yes | Figma Personal Access Token. Needs read access to all libraries you want to sync. |
 | `PORT` | No | HTTP port (default: 3001). Railway sets this automatically. |
-| `JWT_SECRET` | Cloud only | Secret used to sign JWTs for cloud mode authentication. Use a long random string. |
-| `TOKEN_ENCRYPTION_KEY` | Cloud only | 64-character hex string (32 bytes) for AES-256-GCM encryption of stored OAuth tokens. Generate with `openssl rand -hex 32`. |
-| `FIGMA_CLIENT_ID` | Cloud only | Client ID from the Figma developer portal. |
-| `FIGMA_CLIENT_SECRET` | Cloud only | Client secret from the Figma developer portal. |
-| `FIGMA_REDIRECT_URI` | Cloud only | Must match the redirect URL registered in the Figma developer portal. Example: `https://your-server.com/auth/figma/callback` |
 
 ---
 
@@ -96,31 +80,17 @@ docker run -p 3001:3001 \
 | `GET` | `/library/check` | Lightweight check. Returns whether the library has changed since `lastPublished`. |
 | `GET` | `/verify-component` | Verify a single component key against approved libraries. |
 | `POST` | `/verify-components` | Batch verify multiple component keys. |
-| `GET` | `/auth/figma` | Start Figma OAuth flow. Redirects to Figma's authorization page. |
-| `GET` | `/auth/figma/callback` | OAuth callback. Exchanges code for token and stores JWT keyed by state. |
-| `GET` | `/auth/poll` | Plugin polls this to pick up the JWT after the user authorizes. |
-| `GET` | `/auth/me` | Returns the authenticated user's profile (requires JWT). |
-
----
-
-## Generating TOKEN_ENCRYPTION_KEY
-
-```bash
-openssl rand -hex 32
-```
-
-Paste the output as the value of `TOKEN_ENCRYPTION_KEY`.
 
 ---
 
 ## Getting a Figma PAT
 
-1. Go to Figma → Account Settings → Security
-2. Click **Generate new token**
-3. Give it a name (e.g. "Design Guardian Server")
+1. Open Figma and click your avatar at the top-right
+2. Go to Settings > Security > Personal access tokens
+3. Click **Generate new token** and give it a name like "Design Guardian"
 4. Copy the token (it won't be shown again)
 
-The token needs read access to any Figma files and libraries you want Design Guardian to sync.
+Use a token from an account that has access to all team libraries you want to sync.
 
 ---
 
