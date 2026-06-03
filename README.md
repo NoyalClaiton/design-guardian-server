@@ -1,4 +1,4 @@
-# Design Guardian — Server
+# Design Guardian: Server
 
 Backend server for the [Design Guardian](https://www.figma.com/community/plugin/design-guardian) Figma plugin. Handles Figma library syncing, component verification, and cloud authentication.
 
@@ -22,7 +22,7 @@ Backend server for the [Design Guardian](https://www.figma.com/community/plugin/
 
 ---
 
-## Quickstart — Local
+## Quickstart: Local
 
 ```bash
 git clone https://github.com/NoyalClaiton/design-guardian-server.git
@@ -52,7 +52,7 @@ Server starts on `http://localhost:3001`. Point the Design Guardian plugin to th
 
 ---
 
-## Quickstart — Docker
+## Quickstart: Docker
 
 ```bash
 docker build -t design-guardian-server .
@@ -97,7 +97,7 @@ docker run -p 3001:3001 \
 | `GET` | `/health` | Health check. Returns `{ ok: true }`. |
 | `GET` | `/library` | Fetch synced library data (components, styles, variables). |
 | `GET` | `/library/status` | Current sync status for configured libraries. |
-| `GET` | `/library/check` | Lightweight check — returns whether the library has changed since `lastPublished`. |
+| `GET` | `/library/check` | Lightweight check. Returns whether the library has changed since `lastPublished`. |
 | `GET` | `/verify-component` | Verify a single component key against approved libraries. |
 | `POST` | `/verify-components` | Batch verify multiple component keys. |
 | `GET` | `/auth/figma` | Start Figma OAuth flow. Redirects to Figma's authorization page. |
@@ -122,7 +122,7 @@ Paste the output as the value of `TOKEN_ENCRYPTION_KEY`.
 1. Go to Figma → Account Settings → Security
 2. Click **Generate new token**
 3. Give it a name (e.g. "Design Guardian Server")
-4. Copy the token — it won't be shown again
+4. Copy the token (it won't be shown again)
 
 The token needs read access to any Figma files and libraries you want Design Guardian to sync.
 
