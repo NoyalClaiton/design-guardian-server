@@ -1,6 +1,6 @@
 # Design Guardian: Server
 
-Backend server for the [Design Guardian](https://www.figma.com/community/plugin/design-guardian) Figma plugin. Handles Figma library syncing, component verification, and cloud authentication.
+Backend server for the Design Guardian Figma plugin. Handles Figma library syncing, component verification, and cloud authentication.
 
 ---
 
@@ -58,8 +58,6 @@ Server starts on `http://localhost:3001`. Point the Design Guardian plugin to th
 docker build -t design-guardian-server .
 docker run -p 3001:3001 \
   -e FIGMA_PAT=your_token \
-  -e JWT_SECRET=your_secret \
-  -e TOKEN_ENCRYPTION_KEY=your_hex_key \
   design-guardian-server
 ```
 
@@ -67,11 +65,9 @@ docker run -p 3001:3001 \
 
 ## Deploy to Railway
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com)
-
 1. Fork this repo
 2. Create a new Railway project from your fork
-3. Set the environment variables (see table below)
+3. Set the environment variables in the Railway dashboard (see table below)
 4. Railway will build and deploy automatically using the Dockerfile
 
 ---
@@ -130,7 +126,7 @@ The token needs read access to any Figma files and libraries you want Design Gua
 
 ## Plugin
 
-The Design Guardian Figma plugin is a separate repository. The plugin communicates with this server for library syncing and component validation. In self-hosted mode, point the plugin to your server URL in the plugin settings.
+The Design Guardian Figma plugin communicates with this server for library syncing and component validation. In self-hosted mode, point the plugin to your server URL in the plugin settings.
 
 ---
 

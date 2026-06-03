@@ -1203,7 +1203,7 @@ async function requestHandler(req, res) {
     if (req.method === 'GET' && url.pathname === '/library') {
       const requestReceivedTime = Date.now();
       if (!FIGMA_PAT) {
-        sendJson(res, 500, { error: 'FIGMA_PAT is missing in .env' });
+        sendJson(res, 500, { error: 'FIGMA_PAT environment variable is not set' });
         return;
       }
 
@@ -1294,7 +1294,7 @@ async function requestHandler(req, res) {
 
     if (req.method === 'GET' && url.pathname === '/verify-component') {
       if (!FIGMA_PAT) {
-        sendJson(res, 500, { error: 'FIGMA_PAT is missing in .env' });
+        sendJson(res, 500, { error: 'FIGMA_PAT environment variable is not set' });
         return;
       }
 
@@ -1325,7 +1325,7 @@ async function requestHandler(req, res) {
     // Reduces 147 individual requests to ~5-10 batch requests on large files.
     if (req.method === 'POST' && url.pathname === '/verify-components') {
       if (!FIGMA_PAT) {
-        sendJson(res, 500, { error: 'FIGMA_PAT is missing in .env' });
+        sendJson(res, 500, { error: 'FIGMA_PAT environment variable is not set' });
         return;
       }
 
