@@ -1,25 +1,34 @@
 # Design Guardian: Server
 
-Backend server for the Design Guardian Figma plugin. Handles Figma library syncing and component verification.
+This is the backend server for the **Design Guardian** Figma plugin.
+
+Design Guardian helps design teams check whether their Figma files follow the rules of their design system. For example, it can flag components, colors, or text styles that are not from the approved library.
+
+This server is what powers that checking. It connects to your Figma account, pulls in your design system library data, and makes it available to the plugin.
 
 ---
 
-## What it does
+## How it works
 
-- Syncs Figma library components, styles, and variables via the Figma REST API
-- Caches library data so the plugin can run fast, offline-tolerant scans
-- Verifies component approval against configured design system libraries
-
----
-
-## Requirements
-
-- Node.js 20+
-- A Figma Personal Access Token (PAT) with read access to your libraries
+1. You run this server (on your own machine or a hosting platform like Railway)
+2. You give it a Figma token so it can access your Figma libraries
+3. You point the Design Guardian plugin to your server URL
+4. The plugin scans your Figma files and reports any design system violations
 
 ---
 
-## Quickstart: Local
+## Before you start
+
+You will need:
+
+- **Node.js 20 or later** installed on your machine ([download here](https://nodejs.org))
+- A **Figma Personal Access Token** (see instructions below)
+
+---
+
+## Option 1: Run locally on your machine
+
+**Step 1.** Clone the repository and install dependencies:
 
 ```bash
 git clone https://github.com/NoyalClaiton/design-guardian-server.git
@@ -27,76 +36,68 @@ cd design-guardian-server
 npm install
 ```
 
-Create a `.env` file:
+**Step 2.** Create a file called `.env` in the project folder with the following content:
 
-```env
-FIGMA_PAT=your_figma_personal_access_token
 ```
+FIGMA_PAT=paste_your_figma_token_here
+```
+
+**Step 3.** Start the server:
 
 ```bash
 node server.js
 ```
 
-Server starts on `http://localhost:3001`. Point the Design Guardian plugin to this URL in its self-hosted mode settings.
+The server will be running at `http://localhost:3001`. Open the Design Guardian plugin in Figma, go to settings, and enter this URL.
 
 ---
 
-## Quickstart: Docker
+## Option 2: Run with Docker
+
+If you have Docker installed, you can run the server without setting up Node.js:
 
 ```bash
 docker build -t design-guardian-server .
 docker run -p 3001:3001 \
-  -e FIGMA_PAT=your_token \
+  -e FIGMA_PAT=paste_your_figma_token_here \
   design-guardian-server
 ```
 
 ---
 
-## Deploy to Railway
+## Option 3: Deploy to Railway (hosted in the cloud)
 
-1. Fork this repo
-2. Create a new Railway project from your fork
-3. Add `FIGMA_PAT` in the Railway dashboard under Variables
-4. Railway will build and deploy automatically using the Dockerfile
+Railway is a hosting platform that runs the server for you so you do not need to keep your own machine running.
+
+1. Fork this repository to your own GitHub account
+2. Go to [railway.com](https://railway.com) and create a new project from your forked repo
+3. In the Railway dashboard, go to Variables and add `FIGMA_PAT` with your Figma token
+4. Railway will build and deploy the server automatically
+
+Once deployed, copy the public URL Railway gives you and enter it in the Design Guardian plugin settings.
 
 ---
 
-## Environment Variables
+## How to get a Figma Personal Access Token
 
-| Variable | Required | Description |
+A Personal Access Token (PAT) is a key that lets the server read your Figma library data on your behalf.
+
+1. Open Figma in your browser and click your profile picture at the top right
+2. Go to **Settings**, then the **Security** tab
+3. Under **Personal access tokens**, click **Generate new token**
+4. Give it a name like "Design Guardian" and click generate
+5. Copy the token straight away as it will not be shown again
+
+Use a Figma account that has access to all the design system libraries you want to check against.
+
+---
+
+## Configuration
+
+| Setting | Required | Description |
 |---|---|---|
-| `FIGMA_PAT` | Yes | Figma Personal Access Token. Needs read access to all libraries you want to sync. |
-| `PORT` | No | HTTP port (default: 3001). Railway sets this automatically. |
-
----
-
-## API Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Health check. Returns `{ ok: true }`. |
-| `GET` | `/library` | Fetch synced library data (components, styles, variables). |
-| `GET` | `/library/status` | Current sync status for configured libraries. |
-| `GET` | `/library/check` | Lightweight check. Returns whether the library has changed since `lastPublished`. |
-| `GET` | `/verify-component` | Verify a single component key against approved libraries. |
-| `POST` | `/verify-components` | Batch verify multiple component keys. |
-
----
-
-## Getting a Figma PAT
-
-1. Open Figma and click your avatar at the top-right
-2. Go to Settings > Security > Personal access tokens
-3. Click **Generate new token** and give it a name like "Design Guardian"
-4. Copy the token (it won't be shown again)
-
-Use a token from an account that has access to all team libraries you want to sync.
-
----
-
-## Plugin
-
-The Design Guardian Figma plugin communicates with this server for library syncing and component validation. In self-hosted mode, point the plugin to your server URL in the plugin settings.
+| `FIGMA_PAT` | Yes | Your Figma Personal Access Token |
+| `PORT` | No | The port the server runs on. Defaults to 3001. Hosting platforms like Railway set this automatically. |
 
 ---
 
