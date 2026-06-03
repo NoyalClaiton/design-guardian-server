@@ -33,12 +33,12 @@ npm install
 Create a `.env` file:
 
 ```env
-PORT=3001
+# Required
 FIGMA_PAT=your_figma_personal_access_token
+
+# Required only for cloud OAuth mode
 JWT_SECRET=any_long_random_string
 TOKEN_ENCRYPTION_KEY=64_char_hex_string_for_aes256
-
-# Optional: Figma OAuth (cloud mode only)
 FIGMA_CLIENT_ID=your_oauth_client_id
 FIGMA_CLIENT_SECRET=your_oauth_client_secret
 FIGMA_REDIRECT_URI=http://localhost:3001/auth/figma/callback
@@ -81,12 +81,12 @@ docker run -p 3001:3001 \
 | Variable | Required | Description |
 |---|---|---|
 | `FIGMA_PAT` | Yes | Figma Personal Access Token. Needs read access to all libraries you want to sync. |
-| `JWT_SECRET` | Yes | Secret used to sign JWTs issued to plugin clients. Use a long random string. |
-| `TOKEN_ENCRYPTION_KEY` | Yes | 64-character hex string (32 bytes). Used for AES-256-GCM encryption of stored OAuth tokens. Generate with `openssl rand -hex 32`. |
 | `PORT` | No | HTTP port (default: 3001). Railway sets this automatically. |
-| `FIGMA_CLIENT_ID` | OAuth only | Client ID from the Figma developer portal. Required for cloud mode sign-in. |
-| `FIGMA_CLIENT_SECRET` | OAuth only | Client secret from the Figma developer portal. Required for cloud mode sign-in. |
-| `FIGMA_REDIRECT_URI` | OAuth only | Must match the redirect URL registered in the Figma developer portal. Example: `https://your-server.com/auth/figma/callback` |
+| `JWT_SECRET` | Cloud only | Secret used to sign JWTs for cloud mode authentication. Use a long random string. |
+| `TOKEN_ENCRYPTION_KEY` | Cloud only | 64-character hex string (32 bytes) for AES-256-GCM encryption of stored OAuth tokens. Generate with `openssl rand -hex 32`. |
+| `FIGMA_CLIENT_ID` | Cloud only | Client ID from the Figma developer portal. |
+| `FIGMA_CLIENT_SECRET` | Cloud only | Client secret from the Figma developer portal. |
+| `FIGMA_REDIRECT_URI` | Cloud only | Must match the redirect URL registered in the Figma developer portal. Example: `https://your-server.com/auth/figma/callback` |
 
 ---
 
