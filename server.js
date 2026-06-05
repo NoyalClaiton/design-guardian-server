@@ -2,13 +2,14 @@ require('dotenv').config();
 
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-const PORT = process.env.PORT || 3001;
+const PORT = parseInt(process.env.PORT, 10) || 3001;
 const FIGMA_PAT = process.env.FIGMA_PAT;
 
 // ── OAuth / Cloud auth config ────────────────────────────────────────────────
@@ -1568,17 +1569,62 @@ async function requestHandler(req, res) {
   }
 }
 
-const certPath = path.join(__dirname, 'design-guardian.local.pem');
-const keyPath = path.join(__dirname, 'design-guardian.local-key.pem');
-
-if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
-  const tlsOptions = {
-    cert: fs.readFileSync(certPath),
-    key: fs.readFileSync(keyPath)
-  };
-  https.createServer(tlsOptions, requestHandler).listen(PORT, '0.0.0.0', () => {
-  });
-} else {
-  http.createServer(requestHandler).listen(PORT, '0.0.0.0', () => {
+function findAvailablePort(preferred) {
+  return new Promise(function(resolve, reject) {
+    var port = preferred;
+    var maxAttempts = 10;
+    var attempts = 0;
+    function tryPort() {
+      if (attempts >= maxAttempts) {
+        reject(new Error('No available port found between ' + preferred + ' and ' + (preferred + maxAttempts - 1)));
+        return;
+      }
+      attempts++;
+      var probe = net.createServer();
+      probe.once('error', function(err) {
+        if (err.code === 'EADDRINUSE') {
+          port++;
+          tryPort();
+        } else {
+          reject(err);
+        }
+      });
+      probe.once('listening', function() {
+        probe.close(function() { resolve(port); });
+      });
+      probe.listen(port, '0.0.0.0');
+    }
+    tryPort();
   });
 }
+
+const certPath = path.join(__dirname, 'design-guardian.local.pem');
+const keyPath = path.join(__dirname, 'design-guardian.local-key.pem');
+const hasTls = fs.existsSync(certPath) && fs.existsSync(keyPath);
+
+findAvailablePort(PORT).then(function(port) {
+  var protocol = hasTls ? 'https' : 'http';
+  var host = hasTls ? 'design-guardian.local' : 'localhost';
+  var serverUrl = protocol + '://' + host + ':' + port;
+
+  function onListening() {
+    console.log('[Design Guardian] Server ready');
+    console.log('[Design Guardian] Paste this URL into plugin settings: ' + serverUrl);
+    if (port !== PORT) {
+      console.log('[Design Guardian] Port ' + PORT + ' was busy - using ' + port + ' instead');
+    }
+  }
+
+  if (hasTls) {
+    var tlsOptions = {
+      cert: fs.readFileSync(certPath),
+      key: fs.readFileSync(keyPath)
+    };
+    https.createServer(tlsOptions, requestHandler).listen(port, '0.0.0.0', onListening);
+  } else {
+    http.createServer(requestHandler).listen(port, '0.0.0.0', onListening);
+  }
+}).catch(function(err) {
+  console.error('[Design Guardian] Failed to start server: ' + err.message);
+  process.exit(1);
+});
