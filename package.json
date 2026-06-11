@@ -12,5 +12,8 @@
     "bonjour-service": "1.4.0",
     "dotenv": "^17.3.1",
     "jsonwebtoken": "^9.0.3"
+  },
+  "overrides": {
+    "semver": "7.7.2"
   }
 }
