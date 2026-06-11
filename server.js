@@ -1085,6 +1085,9 @@ async function requestHandler(req, res) {
 
   try {
     const url = new URL(req.url, `http://localhost:${PORT}`);
+    if (url.pathname !== '/health') {
+      console.log('[Request] ' + req.method + ' ' + url.pathname + (url.search ? url.search : ''));
+    }
 
     if (req.method === 'GET' && url.pathname === '/health') {
       sendJson(res, 200, {
@@ -1189,10 +1192,12 @@ async function requestHandler(req, res) {
         cacheSet(normalizedKey, placeholderData);
 
         // Start background fetch WITHOUT WAITING (pass normalizedKey so it can update cache at each phase)
+        console.log('[Sync] Starting Figma library fetch for key=' + normalizedKey + ' (PAT configured: ' + Boolean(FIGMA_PAT) + ')');
         getLibraryData(fileKey, normalizedKey)
           .then(data => {
             // Cache the completed library data so subsequent /library requests hit the cache
             cacheSet(normalizedKey, data);
+            console.log('[Sync] Library fetch complete for key=' + normalizedKey);
           })
           .catch(err => {
             console.error('[Background] getLibraryData failed for key=' + normalizedKey + ':', err.message);
@@ -1669,6 +1674,12 @@ findAvailablePort(PORT).then(function(port) {
       console.log('[Design Guardian] HTTPS is required for the Figma desktop app.');
       console.log('[Design Guardian] Install mkcert and restart the server:');
       console.log('[Design Guardian]   ' + installCmd);
+    }
+    if (!FIGMA_PAT) {
+      console.warn('');
+      console.warn('[Design Guardian] WARNING: FIGMA_PAT is not set in your .env file.');
+      console.warn('[Design Guardian] Library sync will fail. Add FIGMA_PAT=your_token to .env and restart.');
+      console.warn('');
     }
   }
 
