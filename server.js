@@ -5,6 +5,17 @@ const https = require('https');
 const net = require('net');
 let _bonjour = null;
 try { const { Bonjour } = require('bonjour-service'); _bonjour = new Bonjour(); } catch (e) {}
+
+// Bonjour throws asynchronously when another instance already advertises the same name.
+// Catch it here so the crash doesn't take down the HTTPS server.
+process.on('uncaughtException', function(err) {
+  if (err && typeof err.message === 'string' && err.message.indexOf('already in use on the network') !== -1) {
+    console.warn('[Design Guardian] mDNS: another server is already advertising on this network. Service discovery disabled for this instance.');
+    return;
+  }
+  console.error('[Design Guardian] Fatal error:', err);
+  process.exit(1);
+});
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
