@@ -4,18 +4,22 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 let _bonjour = null;
-try { const { Bonjour } = require('bonjour-service'); _bonjour = new Bonjour(); } catch (e) {}
-
-// Bonjour throws asynchronously when another instance already advertises the same name.
-// Catch it here so the crash doesn't take down the HTTPS server.
-process.on('uncaughtException', function(err) {
-  if (err && typeof err.message === 'string' && err.message.indexOf('already in use on the network') !== -1) {
-    console.warn('[Design Guardian] mDNS: another server is already advertising on this network. Service discovery disabled for this instance.');
-    return;
+try {
+  const { Bonjour } = require('bonjour-service');
+  _bonjour = new Bonjour();
+  // bonjour.server.errorCallback defaults to `throw err` which crashes the process
+  // when another instance is already advertising the same mDNS name. Replace it
+  // with a no-op for the "already in use" case so the server stays alive.
+  if (_bonjour.server) {
+    _bonjour.server.errorCallback = function(err) {
+      if (err && typeof err.message === 'string' && err.message.indexOf('already in use') !== -1) {
+        console.warn('[Design Guardian] mDNS: service name already in use. Discovery disabled for this instance.');
+        return;
+      }
+      throw err;
+    };
   }
-  console.error('[Design Guardian] Fatal error:', err);
-  process.exit(1);
-});
+} catch (e) {}
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
