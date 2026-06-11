@@ -1101,8 +1101,10 @@ async function requestHandler(req, res) {
       const requestReceivedTime = Date.now();
       const fileKey = url.searchParams.get('fileKey');
       const normalizedKey = normalizeFileKey(fileKey);
+      console.log('[Status] fileKey=' + fileKey + ' normalizedKey=' + normalizedKey);
 
       if (!normalizedKey) {
+        console.log('[Status] Rejecting: missing/invalid fileKey');
         sendJson(res, 400, { ok: false, error: 'Missing fileKey parameter' });
         return;
       }
@@ -1175,6 +1177,7 @@ async function requestHandler(req, res) {
             : 'Library data is loading, full-depth fetch in progress...'
         };
 
+        console.log('[Status] Sending cached response: status=' + (cached.data.status || 'unknown') + ' key=' + normalizedKey);
         const responseTime = Date.now() - requestReceivedTime;
         sendJson(res, 200, response);
       } else {
@@ -1220,6 +1223,7 @@ async function requestHandler(req, res) {
           message: 'Starting library fetch...'
         };
 
+        console.log('[Status] Sending pending response for key=' + normalizedKey);
         const responseTime = Date.now() - requestReceivedTime;
         sendJson(res, 200, response);
       }
