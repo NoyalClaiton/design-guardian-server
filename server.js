@@ -3,11 +3,14 @@ require('dotenv').config();
 const http = require('http');
 const https = require('https');
 const net = require('net');
+let _bonjour = null;
+try { const { Bonjour } = require('bonjour-service'); _bonjour = new Bonjour(); } catch (e) {}
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const { execSync, spawnSync } = require('child_process');
 
 const PORT = parseInt(process.env.PORT, 10) || 3001;
 const FIGMA_PAT = process.env.FIGMA_PAT;
@@ -288,7 +291,8 @@ function sendJson(res, status, data) {
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Private-Network': 'true'
   });
 
   res.end(jsonString, function() {
@@ -1057,7 +1061,8 @@ async function requestHandler(req, res) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+      'Access-Control-Allow-Private-Network': 'true'
     });
     res.end();
     return;
@@ -1600,31 +1605,68 @@ function findAvailablePort(preferred) {
 
 const certPath = path.join(__dirname, 'design-guardian.local.pem');
 const keyPath = path.join(__dirname, 'design-guardian.local-key.pem');
-const hasTls = fs.existsSync(certPath) && fs.existsSync(keyPath);
+
+function tryGenerateCertsWithMkcert() {
+  var check = spawnSync('mkcert', ['--version'], { stdio: 'pipe' });
+  if (check.error || check.status !== 0) return false;
+  // -install adds the local CA to the system trust store; needs sudo on macOS so inherit stdio for the password prompt
+  console.log('[Design Guardian] Installing local CA via mkcert (you may be prompted for your password)...');
+  var install = spawnSync('mkcert', ['-install'], { stdio: 'inherit', timeout: 60000 });
+  if (install.error) return false;
+  var gen = spawnSync('mkcert', ['design-guardian.local'], { cwd: __dirname, stdio: 'pipe', timeout: 30000 });
+  return !gen.error && gen.status === 0;
+}
+
+let hasTls = fs.existsSync(certPath) && fs.existsSync(keyPath);
+if (!hasTls) {
+  if (tryGenerateCertsWithMkcert()) {
+    hasTls = fs.existsSync(certPath) && fs.existsSync(keyPath);
+    if (hasTls) console.log('[Design Guardian] Generated TLS certificate via mkcert');
+  } else {
+    console.log('[Design Guardian] mkcert not found - run: brew install mkcert (then restart for HTTPS)');
+  }
+}
 
 findAvailablePort(PORT).then(function(port) {
   var protocol = hasTls ? 'https' : 'http';
-  var host = hasTls ? 'design-guardian.local' : 'localhost';
-  var serverUrl = protocol + '://' + host + ':' + port;
+  var serverUrl = protocol + '://design-guardian.local:' + port;
 
   function onListening() {
-    console.log('[Design Guardian] Server ready');
-    console.log('[Design Guardian] Paste this URL into plugin settings: ' + serverUrl);
+    var bar = '-'.repeat(Math.max(serverUrl.length + 6, 52));
+    console.log('');
+    console.log('[Design Guardian] Server started');
     if (port !== PORT) {
-      console.log('[Design Guardian] Port ' + PORT + ' was busy - using ' + port + ' instead');
+      console.log('[Design Guardian] Port ' + PORT + ' was in use, switched to ' + port);
+    }
+    console.log('');
+    console.log(bar);
+    console.log('  Plugin URL:');
+    console.log('  ' + serverUrl);
+    console.log('');
+    console.log('  Copy the URL above and paste it into the plugin settings.');
+    console.log(bar);
+    console.log('');
+    if (_bonjour) {
+      _bonjour.publish({ name: 'Design Guardian', type: hasTls ? 'https' : 'http', port: port, host: 'design-guardian.local' });
+    }
+    if (!hasTls) {
+      var installCmd = process.platform === 'win32' ? 'choco install mkcert' : 'brew install mkcert';
+      console.log('[Design Guardian] HTTPS is required for the Figma desktop app.');
+      console.log('[Design Guardian] Install mkcert and restart the server:');
+      console.log('[Design Guardian]   ' + installCmd);
     }
   }
 
   if (hasTls) {
-    var tlsOptions = {
-      cert: fs.readFileSync(certPath),
-      key: fs.readFileSync(keyPath)
-    };
-    https.createServer(tlsOptions, requestHandler).listen(port, '0.0.0.0', onListening);
+    https.createServer({ cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) }, requestHandler).listen(port, '0.0.0.0', onListening);
   } else {
     http.createServer(requestHandler).listen(port, '0.0.0.0', onListening);
   }
 }).catch(function(err) {
-  console.error('[Design Guardian] Failed to start server: ' + err.message);
+  console.error('');
+  console.error('[Design Guardian] Could not start: ' + err.message);
+  console.error('[Design Guardian] Ports 3001-3010 are the only ones the Figma plugin is allowed to connect to.');
+  console.error('[Design Guardian] Free up one of those ports and try again.');
+  console.error('');
   process.exit(1);
 });
