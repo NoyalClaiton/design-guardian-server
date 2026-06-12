@@ -680,10 +680,12 @@ async function fetchComponentSignatures(fileKey, componentNodeIds, headers, comp
   const allRawSignatures = {};
   let successBatches = 0;
   let failedBatches = 0;
+  const failedBatchErrors = [];
 
   for (const { result, batchIds, batchIndex } of batchResults) {
     if (!result.ok) {
       failedBatches++;
+      if (failedBatchErrors.length < 3 && result.error) failedBatchErrors.push(result.error);
       continue;
     }
     const batchSigs = extractSignaturesFromNodesResponse(result.data, batchIds);
@@ -699,7 +701,7 @@ async function fetchComponentSignatures(fileKey, componentNodeIds, headers, comp
     if (c.nodeId) componentByNodeId[c.nodeId] = c;
   }
 
-  return componentNodeIds
+  const signatures = componentNodeIds
     .filter(nodeId => allRawSignatures[nodeId])
     .map(nodeId => {
       const c = componentByNodeId[nodeId] || {};
@@ -719,6 +721,19 @@ async function fetchComponentSignatures(fileKey, componentNodeIds, headers, comp
         layoutMode: sig.layoutMode
       };
     });
+
+  // Return structured shape so caller can detect total Phase 2 failure ("all N batches
+  // failed") and transition the cache to status='error' instead of silently writing
+  // status='complete' with an empty signatures array. Empty-signatures-complete used to
+  // degrade every signature-dependent rule (I05/I07/etc.) with no user-visible warning.
+  return {
+    signatures,
+    successBatches,
+    failedBatches,
+    totalBatches: batches.length,
+    allFailed: batches.length > 0 && successBatches === 0,
+    sampleErrors: failedBatchErrors
+  };
 }
 
 async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
@@ -894,9 +909,14 @@ async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
 
   // ✓ PHASE 1 COMPLETE: UPDATE CACHE WITH STATUS='SHALLOW'
   // Build shallow data object with components and styles (signatures will be empty at this point)
+  // createdAt is REQUIRED so the /library/status cache-hit branch (line ~1127) can detect
+  // when a shallow entry has been stuck for >30s and invalidate it. Without this field the
+  // shallow entry lingers indefinitely, polling clients see status=shallow forever, and the
+  // 4-minute client backstop is the only escape.
   const shallowData = {
     ok: true,
     status: 'shallow',
+    createdAt: Date.now(),
     message: 'Library loaded (shallow). You can scan now. Full depth loading in background...',
     bucket: reclassifiedBucket,
     estimatedSyncTime: reclassifiedEstimatedSyncTime,
@@ -1001,17 +1021,56 @@ async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
     }
   }
 
+  // markCacheAsError: transitions a shallow cache entry to status='error' so the polling
+  // client surfaces the failure immediately instead of waiting out the 4-minute backstop.
+  // Called when Phase 2 (component signatures) throws, or when every signature batch
+  // fails (total Figma outage / rate-limit storm).
+  function markCacheAsError(errMessage) {
+    const normalizedKeyForError = normalizeFileKey(fileKey);
+    if (libraryCache.has(normalizedKeyForError)) {
+      const cached = cacheGet(normalizedKeyForError);
+      if (cached) {
+        cached.data.status = 'error';
+        cached.data.error = errMessage;
+        cached.data.message = 'Library sync failed during Phase 2: ' + errMessage;
+        totalCacheSizeBytes -= cached.sizeBytes;
+        cached.sizeBytes = getCacheEntrySize(cached.data);
+        totalCacheSizeBytes += cached.sizeBytes;
+        cached.timestamp = Date.now();
+        cached.lastAccessed = Date.now();
+      }
+    }
+  }
+
   if (componentNodeIdsToFetch.length === 0) {
     // All components unchanged — immediately mark complete
     const reusedSignatures = Object.values(reusedSignaturesByNodeId);
     updateCacheWithSignatures(reusedSignatures);
   } else {
     fetchComponentSignatures(fileKey, componentNodeIdsToFetch, headers, components)
-      .then(function(newSignatures) {
-        const mergedSignatures = Object.values(reusedSignaturesByNodeId).concat(newSignatures);
+      .then(function(result) {
+        // Total Phase 2 failure: every Figma /nodes batch returned an error. Writing
+        // status='complete' here would set componentSignatures=[] and silently degrade
+        // every signature-dependent rule (I05/I07 shallow-sync guard, etc.) with no
+        // user-visible warning. Surface as an error so the client retries explicitly.
+        if (result.allFailed) {
+          const sample = result.sampleErrors.length > 0 ? ': ' + result.sampleErrors.join('; ') : '';
+          const msg = 'All ' + result.totalBatches + ' Figma /nodes batches failed' + sample;
+          console.error('[Sync] Phase 2 total failure for key=' + normalizeFileKey(fileKey) + ': ' + msg);
+          markCacheAsError(msg);
+          return;
+        }
+        const mergedSignatures = Object.values(reusedSignaturesByNodeId).concat(result.signatures);
         updateCacheWithSignatures(mergedSignatures);
       })
       .catch(function(err) {
+        // Phase 2 threw (network failure, rejected promise from inside fetchComponentSignatures).
+        // Previously this catch was empty: the error vanished, the cache stayed at 'shallow'
+        // forever, and polling clients waited the full 4-minute backstop. Now the error is
+        // logged AND written to the cache so the next /library/status poll surfaces it.
+        const errMsg = (err && err.message) || 'Phase 2 component signature fetch threw';
+        console.error('[Sync] Phase 2 exception for key=' + normalizeFileKey(fileKey) + ': ' + errMsg);
+        markCacheAsError(errMsg);
       });
   }
 
@@ -1124,12 +1183,25 @@ async function requestHandler(req, res) {
 
         // Only validate cache if it's complete (avoid redundant API calls on pending/shallow)
         if (cachedStatus !== 'complete') {
-          const pendingAge = Date.now() - (cached.data?.createdAt || Date.now());
-          if (pendingAge > 30000) {
-            totalCacheSizeBytes -= cached.sizeBytes;
-            libraryCache.delete(normalizedKey);
-          } else {
+          // 'pending' = placeholder written before Phase 1 finishes. If it lingers past 30s
+          // Phase 1 has stalled and we should restart with a fresh fetch.
+          //
+          // 'shallow' = Phase 1 done, Phase 2 in progress. Do NOT invalidate here. Phase 2
+          // is bounded by fetchJsonOptional's 60s per-batch timeout (batches run in parallel)
+          // and now has explicit terminal transitions: updateCacheWithSignatures on success,
+          // markCacheAsError on failure. Invalidating shallow under Phase 2 would race the
+          // still-running Phase 2 promise: it would write to a new fetch's cache entry and
+          // corrupt the data (status could oscillate shallow/complete/shallow forever).
+          if (cachedStatus === 'shallow') {
             useCache = true;
+          } else {
+            const pendingAge = Date.now() - (cached.data?.createdAt || Date.now());
+            if (pendingAge > 30000) {
+              totalCacheSizeBytes -= cached.sizeBytes;
+              libraryCache.delete(normalizedKey);
+            } else {
+              useCache = true;
+            }
           }
         } else {
           // Skip Figma metadata call if we validated recently (polling every few seconds)
