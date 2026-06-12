@@ -1249,16 +1249,20 @@ async function requestHandler(req, res) {
       if (useCache) {
         // Return current cached status
         const cached = cacheGet(normalizedKey);
+        const cachedStatusForResponse = cached.data.status || 'unknown';
         const response = {
-          ok: true,
+          ok: cachedStatusForResponse !== 'error',
           fileKey: normalizedKey,
-          status: cached.data.status || 'unknown',
+          status: cachedStatusForResponse,
           bucket: cached.data.bucket || 'unknown',
           estimatedSyncTime: cached.data.estimatedSyncTime || 0,
           totalComponentsCount: cached.data.totalComponentsCount || 0,
-          message: cached.data.status === 'complete'
+          message: cachedStatusForResponse === 'complete'
             ? 'Library data is complete and ready to scan'
-            : 'Library data is loading, full-depth fetch in progress...'
+            : cachedStatusForResponse === 'error'
+              ? (cached.data.message || 'Library sync failed')
+              : 'Library data is loading, full-depth fetch in progress...',
+          error: cached.data.error || undefined
         };
 
         console.log('[Status] Sending cached response: status=' + (cached.data.status || 'unknown') + ' key=' + normalizedKey);
