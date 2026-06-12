@@ -3,17 +3,29 @@ require('dotenv').config();
 const http = require('http');
 const https = require('https');
 const net = require('net');
+
+// Suppress the mDNS "already in use" error that fires when two server instances
+// run on the same machine. The error originates deep inside bonjour's event chain
+// and can't be caught by errorCallback alone -- a process-level handler is needed.
+process.on('uncaughtException', function(err) {
+  var msg = err && err.message ? err.message : String(err);
+  var stack = err && err.stack ? err.stack : '';
+  if (msg.indexOf('already in use') !== -1 && (stack.indexOf('bonjour') !== -1 || stack.indexOf('multicast-dns') !== -1)) {
+    console.log('[Design Guardian] Note: mDNS auto-discovery is already advertised by another server instance. This is harmless -- your server is running normally and the plugin can connect using the URL shown above.');
+    return;
+  }
+  console.error('[Design Guardian] Unexpected error:', err);
+  process.exit(1);
+});
+
 let _bonjour = null;
 try {
   const { Bonjour } = require('bonjour-service');
   _bonjour = new Bonjour();
-  // bonjour.server.errorCallback defaults to `throw err` which crashes the process
-  // when another instance is already advertising the same mDNS name. Replace it
-  // with a no-op for the "already in use" case so the server stays alive.
   if (_bonjour.server) {
     _bonjour.server.errorCallback = function(err) {
       if (err && typeof err.message === 'string' && err.message.indexOf('already in use') !== -1) {
-        console.warn('[Design Guardian] mDNS: service name already in use. Discovery disabled for this instance.');
+        console.log('[Design Guardian] Note: mDNS auto-discovery is already advertised by another server instance. This is harmless -- your server is running normally.');
         return;
       }
       throw err;
@@ -1743,7 +1755,15 @@ findAvailablePort(PORT).then(function(port) {
     console.log(bar);
     console.log('');
     if (_bonjour) {
-      _bonjour.publish({ name: 'Design Guardian', type: hasTls ? 'https' : 'http', port: port, host: 'design-guardian.local' });
+      var _svc = _bonjour.publish({ name: 'Design Guardian', type: hasTls ? 'https' : 'http', port: port, host: 'design-guardian.local' });
+      if (_svc && typeof _svc.on === 'function') {
+        _svc.on('error', function(err) {
+          var msg = err && err.message ? err.message : String(err);
+          if (msg.indexOf('already in use') !== -1) {
+            console.log('[Design Guardian] Note: mDNS auto-discovery is already advertised by another server instance. This is harmless -- your server is running normally and the plugin can still connect using the URL above.');
+          }
+        });
+      }
     }
     if (!hasTls) {
       var installCmd = process.platform === 'win32' ? 'choco install mkcert' : 'brew install mkcert';
