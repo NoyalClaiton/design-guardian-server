@@ -205,6 +205,9 @@ async function getFigmaToken(user) {
 // Tracks: lastAccessed (for LRU), timestamp (for freshness), size (for memory pressure)
 const libraryCache = new Map(); // fileKey -> { data, timestamp, lastAccessed, sizeBytes }
 let totalCacheSizeBytes = 0;
+// Tracks keys with an active background getLibraryData job. Prevents parallel syncs
+// for the same key when the pending cache entry expires before the job finishes.
+const activeSyncs = new Set();
 const MAX_CACHE_SIZE_MB = 50;
 const MAX_CACHE_SIZE_BYTES = MAX_CACHE_SIZE_MB * 1024 * 1024;
 // Cache invalidation strategy: based on library's lastModified timestamp, not TTL
@@ -1211,24 +1214,24 @@ async function requestHandler(req, res) {
 
         // Only validate cache if it's complete (avoid redundant API calls on pending/shallow)
         if (cachedStatus !== 'complete') {
-          // 'pending' = placeholder written before Phase 1 finishes. If it lingers past 30s
-          // Phase 1 has stalled and we should restart with a fresh fetch.
+          // 'pending' = placeholder written before Phase 1 finishes. Treat as valid while
+          // an active sync job is running OR for up to 270s (just past the 240s fetchJson
+          // timeout). Previously 30s caused new syncs to start every 30s while the body
+          // download of a large Figma file was still in progress.
           //
           // 'shallow' = Phase 1 done, Phase 2 in progress. Do NOT invalidate here. Phase 2
-          // is bounded by fetchJsonOptional's 60s per-batch timeout (batches run in parallel)
-          // and now has explicit terminal transitions: updateCacheWithSignatures on success,
-          // markCacheAsError on failure. Invalidating shallow under Phase 2 would race the
-          // still-running Phase 2 promise: it would write to a new fetch's cache entry and
-          // corrupt the data (status could oscillate shallow/complete/shallow forever).
+          // is bounded by fetchJsonOptional's timeout and has explicit terminal transitions:
+          // updateCacheWithSignatures on success, markCacheAsError on failure. Invalidating
+          // shallow would race the still-running Phase 2 promise and corrupt the cache.
           if (cachedStatus === 'shallow') {
             useCache = true;
           } else {
             const pendingAge = Date.now() - (cached.data?.createdAt || Date.now());
-            if (pendingAge > 30000) {
+            if (activeSyncs.has(normalizedKey) || pendingAge <= 270000) {
+              useCache = true;
+            } else {
               totalCacheSizeBytes -= cached.sizeBytes;
               libraryCache.delete(normalizedKey);
-            } else {
-              useCache = true;
             }
           }
         } else {
@@ -1298,24 +1301,32 @@ async function requestHandler(req, res) {
         };
         cacheSet(normalizedKey, placeholderData);
 
-        // Start background fetch WITHOUT WAITING (pass normalizedKey so it can update cache at each phase)
-        console.log('[Sync] Starting Figma library fetch for key=' + normalizedKey + ' (PAT configured: ' + Boolean(FIGMA_PAT) + ')');
-        getLibraryData(fileKey, normalizedKey)
-          .then(data => {
-            // Cache the completed library data so subsequent /library requests hit the cache
-            cacheSet(normalizedKey, data);
-            console.log('[Sync] Library fetch complete for key=' + normalizedKey);
-          })
-          .catch(err => {
-            console.error('[Background] getLibraryData failed for key=' + normalizedKey + ':', err.message);
-            cacheSet(normalizedKey, {
-              ok: false,
-              status: 'error',
-              error: err.message,
-              fileKey: normalizedKey,
-              message: 'Library fetch failed: ' + err.message
+        // Start background fetch WITHOUT WAITING. Guard with activeSyncs to prevent
+        // parallel jobs for the same key when the pending TTL expires mid-download.
+        if (activeSyncs.has(normalizedKey)) {
+          console.log('[Sync] Job already running for key=' + normalizedKey + ', skipping duplicate start');
+        } else {
+          activeSyncs.add(normalizedKey);
+          console.log('[Sync] Starting Figma library fetch for key=' + normalizedKey + ' (PAT configured: ' + Boolean(FIGMA_PAT) + ')');
+          getLibraryData(fileKey, normalizedKey)
+            .then(data => {
+              cacheSet(normalizedKey, data);
+              console.log('[Sync] Library fetch complete for key=' + normalizedKey);
+            })
+            .catch(err => {
+              console.error('[Background] getLibraryData failed for key=' + normalizedKey + ':', err.message);
+              cacheSet(normalizedKey, {
+                ok: false,
+                status: 'error',
+                error: err.message,
+                fileKey: normalizedKey,
+                message: 'Library fetch failed: ' + err.message
+              });
+            })
+            .finally(() => {
+              activeSyncs.delete(normalizedKey);
             });
-          });
+        }
 
         // Respond IMMEDIATELY with pending status (do not wait for fetch to complete)
         const response = {
