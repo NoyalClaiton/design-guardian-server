@@ -336,15 +336,15 @@ function sendJson(res, status, data) {
 
 async function fetchJson(url, options = {}) {
 
-  // Add 240-second timeout to prevent hanging on slow/unreachable Figma API
+  // Timeout covers both headers AND body download. Cleared only after response.text()
+  // completes -- clearing at header arrival left large body reads with no timeout.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 240000);
 
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timeoutId);
     const text = await response.text();
-
+    clearTimeout(timeoutId);
 
     let json;
     try {
@@ -370,24 +370,32 @@ async function fetchJson(url, options = {}) {
 async function fetchJsonOptional(url, options = {}) {
 
   try {
-    // Add 60-second timeout to prevent hanging on slow/unreachable Figma API
+    // Timeout covers headers AND body. Cleared only after response.text() completes.
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000);
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
 
     let response;
     try {
       response = await fetch(url, { ...options, signal: controller.signal });
-      clearTimeout(timeoutId);
     } catch (fetchError) {
       clearTimeout(timeoutId);
       if (fetchError.name === 'AbortError') {
-        return { ok: false, error: 'Figma API timeout (240s)' };
+        return { ok: false, error: 'Figma API timeout (120s)' };
       }
       throw fetchError;
     }
 
-    const text = await response.text();
-
+    let text;
+    try {
+      text = await response.text();
+    } catch (bodyError) {
+      clearTimeout(timeoutId);
+      if (bodyError.name === 'AbortError') {
+        return { ok: false, error: 'Figma API timeout (120s)' };
+      }
+      throw bodyError;
+    }
+    clearTimeout(timeoutId);
 
     let json;
     try {
