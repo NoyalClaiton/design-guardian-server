@@ -1715,17 +1715,24 @@ function findAvailablePort(preferred) {
   });
 }
 
-const certPath = path.join(__dirname, 'design-guardian.local.pem');
-const keyPath = path.join(__dirname, 'design-guardian.local-key.pem');
+// Cert covers design-guardian.local + localhost + 127.0.0.1 so the plugin can
+// connect via either hostname without Bonjour conflicts when multiple users run
+// their own server. mkcert names the file with a +2 suffix for 3 domains.
+const certPath = path.join(__dirname, 'design-guardian.local+2.pem');
+const keyPath = path.join(__dirname, 'design-guardian.local+2-key.pem');
 
 function tryGenerateCertsWithMkcert() {
   var check = spawnSync('mkcert', ['--version'], { stdio: 'pipe' });
   if (check.error || check.status !== 0) return false;
+  // Remove old single-host cert if present so server picks up the new multi-host one.
+  var oldCert = path.join(__dirname, 'design-guardian.local.pem');
+  var oldKey = path.join(__dirname, 'design-guardian.local-key.pem');
+  if (fs.existsSync(oldCert)) { try { fs.unlinkSync(oldCert); fs.unlinkSync(oldKey); } catch (e) {} }
   // -install adds the local CA to the system trust store; needs sudo on macOS so inherit stdio for the password prompt
   console.log('[Design Guardian] Installing local CA via mkcert (you may be prompted for your password)...');
   var install = spawnSync('mkcert', ['-install'], { stdio: 'inherit', timeout: 60000 });
   if (install.error) return false;
-  var gen = spawnSync('mkcert', ['design-guardian.local'], { cwd: __dirname, stdio: 'pipe', timeout: 30000 });
+  var gen = spawnSync('mkcert', ['design-guardian.local', 'localhost', '127.0.0.1'], { cwd: __dirname, stdio: 'pipe', timeout: 30000 });
   return !gen.error && gen.status === 0;
 }
 
