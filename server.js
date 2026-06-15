@@ -1748,7 +1748,7 @@ if (!hasTls) {
 
 findAvailablePort(PORT).then(function(port) {
   var protocol = hasTls ? 'https' : 'http';
-  var serverUrl = protocol + '://design-guardian.local:' + port;
+  var serverUrl = protocol + '://localhost:' + port;
 
   function onListening() {
     var bar = '-'.repeat(Math.max(serverUrl.length + 6, 52));
