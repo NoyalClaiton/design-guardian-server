@@ -1,5 +1,13 @@
 require('dotenv').config();
 
+// Fail fast if Node is too old. fetch is built-in from Node 18; older versions throw
+// "fetch is not defined" deep in library sync which is very hard to diagnose.
+if (typeof fetch === 'undefined') {
+  console.error('[Design Guardian] FATAL: Node.js ' + process.version + ' does not have built-in fetch.');
+  console.error('[Design Guardian] Please upgrade to Node.js 18 or later. Download at: https://nodejs.org');
+  process.exit(1);
+}
+
 const http = require('http');
 const https = require('https');
 const net = require('net');
