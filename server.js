@@ -208,6 +208,8 @@ let totalCacheSizeBytes = 0;
 // Tracks keys with an active background getLibraryData job. Prevents parallel syncs
 // for the same key when the pending cache entry expires before the job finishes.
 const activeSyncs = new Set();
+// Truncate file keys in logs to avoid leaking which Figma files are synced.
+function shortKey(key) { return key ? String(key).slice(0, 8) + '...' : '(none)'; }
 const MAX_CACHE_SIZE_MB = 50;
 const MAX_CACHE_SIZE_BYTES = MAX_CACHE_SIZE_MB * 1024 * 1024;
 // Cache invalidation strategy: based on library's lastModified timestamp, not TTL
@@ -1087,7 +1089,7 @@ async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
         if (result.allFailed) {
           const sample = result.sampleErrors.length > 0 ? ': ' + result.sampleErrors.join('; ') : '';
           const msg = 'All ' + result.totalBatches + ' Figma /nodes batches failed' + sample;
-          console.error('[Sync] Phase 2 total failure for key=' + normalizeFileKey(fileKey) + ': ' + msg);
+          console.error('[Sync] Phase 2 total failure for key=' + shortKey(fileKey) + ': ' + msg);
           markCacheAsError(msg);
           return;
         }
@@ -1100,7 +1102,7 @@ async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
         // forever, and polling clients waited the full 4-minute backstop. Now the error is
         // logged AND written to the cache so the next /library/status poll surfaces it.
         const errMsg = (err && err.message) || 'Phase 2 component signature fetch threw';
-        console.error('[Sync] Phase 2 exception for key=' + normalizeFileKey(fileKey) + ': ' + errMsg);
+        console.error('[Sync] Phase 2 exception for key=' + shortKey(fileKey) + ': ' + errMsg);
         markCacheAsError(errMsg);
       });
   }
@@ -1297,17 +1299,17 @@ async function requestHandler(req, res) {
         // Start background fetch WITHOUT WAITING. Guard with activeSyncs to prevent
         // parallel jobs for the same key when the pending TTL expires mid-download.
         if (activeSyncs.has(normalizedKey)) {
-          console.log('[Sync] Job already running for key=' + normalizedKey + ', skipping duplicate start');
+          console.log('[Sync] Job already running for key=' + shortKey(normalizedKey) + ', skipping duplicate start');
         } else {
           activeSyncs.add(normalizedKey);
-          console.log('[Sync] Starting Figma library fetch for key=' + normalizedKey + ' (PAT configured: ' + Boolean(FIGMA_PAT) + ')');
+          console.log('[Sync] Starting Figma library fetch for key=' + shortKey(normalizedKey) + ' (PAT configured: ' + Boolean(FIGMA_PAT) + ')');
           getLibraryData(fileKey, normalizedKey)
             .then(data => {
               cacheSet(normalizedKey, data);
-              console.log('[Sync] Library fetch complete for key=' + normalizedKey);
+              console.log('[Sync] Library fetch complete for key=' + shortKey(normalizedKey));
             })
             .catch(err => {
-              console.error('[Background] getLibraryData failed for key=' + normalizedKey + ':', err.message);
+              console.error('[Background] getLibraryData failed for key=' + shortKey(normalizedKey) + ':', err.message);
               cacheSet(normalizedKey, {
                 ok: false,
                 status: 'error',
