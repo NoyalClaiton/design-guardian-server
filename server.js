@@ -1302,9 +1302,12 @@ async function requestHandler(req, res) {
           // job already running, skip
         } else {
           activeSyncs.add(normalizedKey);
+          const _syncStart = Date.now();
+          console.log('[Sync] Started  key=' + shortKey(normalizedKey));
           getLibraryData(fileKey, normalizedKey)
             .then(data => {
               cacheSet(normalizedKey, data);
+              console.log('[Sync] Complete key=' + shortKey(normalizedKey) + ' (' + ((Date.now() - _syncStart) / 1000).toFixed(1) + 's)');
             })
             .catch(err => {
               console.error('[Background] getLibraryData failed for key=' + shortKey(normalizedKey) + ':', err.message);
