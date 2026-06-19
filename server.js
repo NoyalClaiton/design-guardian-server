@@ -1299,14 +1299,12 @@ async function requestHandler(req, res) {
         // Start background fetch WITHOUT WAITING. Guard with activeSyncs to prevent
         // parallel jobs for the same key when the pending TTL expires mid-download.
         if (activeSyncs.has(normalizedKey)) {
-          console.log('[Sync] Job already running for key=' + shortKey(normalizedKey) + ', skipping duplicate start');
+          // job already running, skip
         } else {
           activeSyncs.add(normalizedKey);
-          console.log('[Sync] Starting Figma library fetch for key=' + shortKey(normalizedKey) + ' (PAT configured: ' + Boolean(FIGMA_PAT) + ')');
           getLibraryData(fileKey, normalizedKey)
             .then(data => {
               cacheSet(normalizedKey, data);
-              console.log('[Sync] Library fetch complete for key=' + shortKey(normalizedKey));
             })
             .catch(err => {
               console.error('[Background] getLibraryData failed for key=' + shortKey(normalizedKey) + ':', err.message);
