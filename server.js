@@ -116,6 +116,7 @@ const _usersById = new Map();
   } catch (_) {}
 })();
 
+// saveUsers: persists the in-memory user store to USERS_FILE (full replace, not append).
 function saveUsers() {
   fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
   fs.writeFileSync(USERS_FILE, JSON.stringify({
@@ -124,6 +125,7 @@ function saveUsers() {
   }, null, 2));
 }
 
+// upsertUser: creates a new user or updates profile + tokens for an existing one; returns the user object.
 function upsertUser(figmaUserId, figmaHandle, figmaEmail, accessToken, refreshToken, tokenExpiresAt) {
   let user = _usersByFigmaId.get(figmaUserId);
   if (user) {
@@ -145,6 +147,7 @@ function getUserById(id) {
   return _usersById.get(parseInt(id)) || null;
 }
 
+// updateUserToken: refreshes only the access token + expiry after an OAuth token refresh; skips profile fields.
 function updateUserToken(id, accessToken, tokenExpiresAt) {
   const user = _usersById.get(parseInt(id));
   if (!user) return;
@@ -186,6 +189,7 @@ function decryptToken(stored) {
 }
 
 // ── JWT helpers ───────────────────────────────────────────────────────────────
+// signJwt: issues a 90-day signed JWT with the user's internal ID as the sub claim.
 function signJwt(userId) {
   if (!JWT_SECRET) throw new Error('JWT_SECRET not set');
   return jwt.sign({ sub: String(userId) }, JWT_SECRET, { expiresIn: '90d' });
@@ -334,31 +338,10 @@ function cacheSet(key, data) {
   evictLRUIfNeeded();
 }
 
+// ── HTTP helpers ─────────────────────────────────────────────────────────────
+// sendJson: serializes data as JSON and writes it with CORS + no-cache headers.
 function sendJson(res, status, data) {
-  const sendStartTime = Date.now();
-
-  // Check if response includes componentSets (only for library data responses, not status responses)
-  const hasLibraryObject = data && data.library;
-  if (hasLibraryObject) {
-    if (data.library.componentSets) {
-    } else {
-    }
-  }
-
   const jsonString = JSON.stringify(data);
-
-  // Verify componentSets survived JSON serialization (only for library data, not status)
-  if (hasLibraryObject) {
-    try {
-      const parsed = JSON.parse(jsonString);
-      if (parsed && parsed.library && parsed.library.componentSets) {
-      } else {
-      }
-    } catch(e) {
-    }
-  }
-  const serializeMs = Date.now() - sendStartTime;
-
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Cache-Control': 'no-store',
@@ -367,11 +350,10 @@ function sendJson(res, status, data) {
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Allow-Private-Network': 'true'
   });
-
-  res.end(jsonString, function() {
-  });
+  res.end(jsonString);
 }
 
+// fetchJson: makes an authenticated Figma API request; throws on non-2xx or JSON parse failure.
 async function fetchJson(url, options = {}) {
 
   // Timeout covers both headers AND body download. Cleared only after response.text()
@@ -405,6 +387,7 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+// fetchJsonOptional: like fetchJson but returns { ok, data } / { ok: false, error } instead of throwing.
 async function fetchJsonOptional(url, options = {}) {
 
   try {
@@ -456,6 +439,7 @@ async function fetchJsonOptional(url, options = {}) {
   }
 }
 
+// normalizeFileKey: extracts a bare file key from a full Figma URL, or returns the input as-is.
 function normalizeFileKey(input) {
   if (!input) return '';
   const value = String(input).trim();
@@ -501,6 +485,7 @@ async function fetchLibraryPublishedMetadata(fileKey, headers) {
   };
 }
 
+// uniqueBy: deduplicates items by a key function; first occurrence wins.
 function uniqueBy(items, getKey) {
   const map = new Map();
   for (const item of items) {
@@ -513,6 +498,7 @@ function uniqueBy(items, getKey) {
   return Array.from(map.values());
 }
 
+// normalizeComponentsFromFile: maps raw file API component entries to the shared normalized shape.
 function normalizeComponentsFromFile(fileData) {
   const raw = Object.entries(fileData.components || {});
   return raw.map(([nodeId, item]) => ({
@@ -527,6 +513,7 @@ function normalizeComponentsFromFile(fileData) {
   }));
 }
 
+// normalizePublishedComponents: maps raw published components API response to the shared normalized shape.
 function normalizePublishedComponents(componentsData) {
   return (componentsData.meta?.components || []).map((item) => ({
     key: item.key || '',
@@ -540,6 +527,7 @@ function normalizePublishedComponents(componentsData) {
   }));
 }
 
+// normalizeStylesFromFile: maps raw file API style entries to the shared normalized shape.
 function normalizeStylesFromFile(fileData) {
   const raw = Object.values(fileData.styles || {});
   return raw.map((item) => {
@@ -558,6 +546,7 @@ function normalizeStylesFromFile(fileData) {
   });
 }
 
+// normalizePublishedStyles: maps raw published styles API response to the shared normalized shape.
 function normalizePublishedStyles(stylesData) {
   return (stylesData.meta?.styles || []).map((item) => {
     const normalized = {
@@ -576,6 +565,7 @@ function normalizePublishedStyles(stylesData) {
   });
 }
 
+// extractAllComponentsFromDocument: walks the full document tree; returns all COMPONENT nodes that have a key.
 function extractAllComponentsFromDocument(document) {
   const components = [];
 
@@ -598,6 +588,7 @@ function extractAllComponentsFromDocument(document) {
   return components;
 }
 
+// extractComponentSignaturesFromDocument: walks the document tree to extract child-structure signatures for the given node IDs.
 function extractComponentSignaturesFromDocument(document, componentNodeIds) {
   const nodeIdSet = new Set(componentNodeIds);
   const signatures = {};
@@ -636,6 +627,7 @@ function extractComponentSignaturesFromDocument(document, componentNodeIds) {
   return signatures;
 }
 
+// normalizeVariables: normalizes the raw Figma variables API response into collections + variable lists.
 function normalizeVariables(variablesData) {
   const meta = variablesData?.meta || {};
   const variableCollections = meta.variableCollections || {};
@@ -732,8 +724,6 @@ async function fetchComponentSignatures(fileKey, componentNodeIds, headers, comp
     batches.push(componentNodeIds.slice(i, i + BATCH_SIZE));
   }
 
-  const batchStartTime = Date.now();
-
   const batchResults = await Promise.all(
     batches.map((batchIds, batchIndex) => {
       // Node IDs contain ':' which must be URL-encoded in query params
@@ -758,8 +748,6 @@ async function fetchComponentSignatures(fileKey, componentNodeIds, headers, comp
     Object.assign(allRawSignatures, batchSigs);
     successBatches++;
   }
-
-  const batchMs = Date.now() - batchStartTime;
 
   // Build final signature objects using component metadata already fetched in Phase 1
   const componentByNodeId = {};
@@ -802,8 +790,9 @@ async function fetchComponentSignatures(fileKey, componentNodeIds, headers, comp
   };
 }
 
+// getLibraryData: fetches all component/style/variable data for a library file from the Figma API.
+// Returns normalized library object; Phase 2 (signatures) runs in the background after Phase 1 returns.
 async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
-  const getLibDataStartTime = Date.now();
   const fileKey = normalizeFileKey(fileKeyRaw);
   if (!fileKey) throw new Error('Missing file key');
 
@@ -1140,8 +1129,6 @@ async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
       });
   }
 
-  const totalGetLibDataMs = Date.now() - getLibDataStartTime;
-
   return {
     ok: true,
     status: 'shallow',  // Signal that this is shallow data
@@ -1196,6 +1183,7 @@ async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
   };
 }
 
+// requestHandler: main HTTP router — handles CORS preflight, all API endpoints, and the 404 fallback.
 async function requestHandler(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -1882,7 +1870,7 @@ async function requestHandler(req, res) {
 
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
           const issues = await runAiContentScan(cfg, model, guidelines, textNodes);
-          sendJson(res, 200, { ok: true, issues });
+          sendJson(res, 200, { ok: true, issues, meta: { provider: cfg.provider, model, nodeCount: textNodes.length } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'AI scan failed' });
         }
