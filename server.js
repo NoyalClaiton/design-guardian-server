@@ -45,7 +45,8 @@ const path = require('path');
 const { URL } = require('url');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const { execSync, spawnSync } = require('child_process');
+const { execSync, spawnSync, spawn, execFile } = require('child_process');
+const os = require('os');
 
 const PORT = parseInt(process.env.PORT, 10) || 3001;
 const FIGMA_PAT = process.env.FIGMA_PAT;
@@ -67,6 +68,38 @@ const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
 // Locally, fall back to users.json next to server.js.
 const USERS_FILE = process.env.USERS_FILE ||
   (process.env.RAILWAY_ENVIRONMENT ? '/data/users.json' : path.join(__dirname, 'users.json'));
+
+// ── AI content review config ──────────────────────────────────────────────────
+// Stored in ai-config.json alongside users.json. Holds provider, model, API key.
+const AI_CONFIG_FILE = process.env.AI_CONFIG_FILE ||
+  (process.env.RAILWAY_ENVIRONMENT ? '/data/ai-config.json' : path.join(__dirname, 'ai-config.json'));
+
+// Content guidelines file — uploaded by user or pasted as text, sent to AI with each scan.
+const GUIDELINES_FILE = process.env.GUIDELINES_FILE ||
+  (process.env.RAILWAY_ENVIRONMENT ? '/data/content-guidelines.md' : path.join(__dirname, 'content-guidelines.md'));
+
+// Default models per provider — used when no model is explicitly saved in ai-config.json.
+const AI_DEFAULT_MODELS = {
+  anthropic: 'claude-haiku-4-5-20251001',
+  openai: 'gpt-4o-mini',
+  google: 'gemini-1.5-flash',
+  ollama: 'llama3',
+};
+
+// loadAiConfig: reads AI provider config from disk; returns safe defaults if file is missing.
+function loadAiConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(AI_CONFIG_FILE, 'utf8'));
+  } catch (_) {
+    return { provider: '', model: '', apiKey: '', ollamaEndpoint: 'http://localhost:11434' };
+  }
+}
+
+// saveAiConfig: writes AI provider config to disk (creates parent dirs if needed).
+function saveAiConfig(cfg) {
+  fs.mkdirSync(path.dirname(AI_CONFIG_FILE), { recursive: true });
+  fs.writeFileSync(AI_CONFIG_FILE, JSON.stringify(cfg, null, 2));
+}
 
 let _nextUserId = 1;
 const _usersByFigmaId = new Map();
@@ -1702,10 +1735,356 @@ async function requestHandler(req, res) {
       return;
     }
 
+    // ── GET /ai/config ───────────────────────────────────────────────────────
+    // Returns current AI provider config (API key masked).
+    if (req.method === 'GET' && url.pathname === '/ai/config') {
+      const cfg = loadAiConfig();
+      sendJson(res, 200, {
+        ok: true,
+        provider: cfg.provider || '',
+        model: cfg.model || '',
+        ollamaEndpoint: cfg.ollamaEndpoint || 'http://localhost:11434',
+        hasApiKey: !!(cfg.apiKey),
+        defaultModels: AI_DEFAULT_MODELS,
+      });
+      return;
+    }
+
+    // ── POST /ai/config ──────────────────────────────────────────────────────
+    // Saves AI provider config. No auth — self-hosted server is user-owned.
+    if (req.method === 'POST' && url.pathname === '/ai/config') {
+      let body = '';
+      req.on('data', function(chunk) { body += chunk; });
+      req.on('end', function() {
+        try {
+          const incoming = JSON.parse(body);
+          const existing = loadAiConfig();
+          const updated = {
+            provider: incoming.provider || existing.provider || '',
+            model: incoming.model || existing.model || '',
+            authMethod: incoming.authMethod || existing.authMethod || 'apikey',
+            ollamaEndpoint: incoming.ollamaEndpoint || existing.ollamaEndpoint || 'http://localhost:11434',
+            // Only update apiKey if a new one was sent; empty string means "keep existing"
+            apiKey: incoming.apiKey !== undefined && incoming.apiKey !== ''
+              ? incoming.apiKey
+              : (existing.apiKey || ''),
+          };
+          saveAiConfig(updated);
+          sendJson(res, 200, { ok: true });
+        } catch (e) {
+          sendJson(res, 400, { error: 'Invalid request body' });
+        }
+      });
+      return;
+    }
+
+    // ── GET /ai/cli-status ───────────────────────────────────────────────────
+    // Returns which provider CLIs are installed and authenticated on this machine.
+    if (req.method === 'GET' && url.pathname === '/ai/cli-status') {
+      const providers = ['anthropic', 'openai', 'google'];
+      const cliNames = { anthropic: 'claude', openai: 'codex', google: 'gemini' };
+      const results = {};
+      await Promise.all(providers.map(async function(p) {
+        const installed = await isCliInstalled(cliNames[p]);
+        const loggedIn = installed ? await checkCliAuth(p) : false;
+        results[p] = { installed: installed, loggedIn: loggedIn };
+      }));
+      sendJson(res, 200, results);
+      return;
+    }
+
+    // ── POST /ai/cli-login ───────────────────────────────────────────────────
+    // Spawns the provider's CLI login process detached so it opens a browser
+    // OAuth flow on the user's machine. Returns immediately — login is async.
+    if (req.method === 'POST' && url.pathname === '/ai/cli-login') {
+      let body = '';
+      req.on('data', function(chunk) { body += chunk; });
+      req.on('end', function() {
+        try {
+          const { provider } = JSON.parse(body);
+          const loginCmds = {
+            anthropic: ['claude', 'login'],
+            google:    ['gemini', 'auth', 'login'],
+            openai:    ['codex', 'login'],
+          };
+          const cmd = loginCmds[provider];
+          if (!cmd) { sendJson(res, 400, { error: 'No login command for provider: ' + provider }); return; }
+          // Spawn detached so the server doesn't block waiting for OAuth to complete
+          const child = spawn(cmd[0], cmd.slice(1), { detached: true, stdio: 'ignore' });
+          child.on('error', function() {});
+          child.unref();
+          sendJson(res, 200, { ok: true });
+        } catch (e) {
+          sendJson(res, 400, { error: 'Invalid request body' });
+        }
+      });
+      return;
+    }
+
+    // ── GET /ai/guidelines ───────────────────────────────────────────────────
+    if (req.method === 'GET' && url.pathname === '/ai/guidelines') {
+      try {
+        const content = fs.readFileSync(GUIDELINES_FILE, 'utf8');
+        sendJson(res, 200, { ok: true, content });
+      } catch (_) {
+        sendJson(res, 200, { ok: true, content: '' });
+      }
+      return;
+    }
+
+    // ── POST /ai/guidelines ──────────────────────────────────────────────────
+    // Saves content guidelines. No auth — self-hosted server is user-owned.
+    if (req.method === 'POST' && url.pathname === '/ai/guidelines') {
+      let body = '';
+      req.on('data', function(chunk) { body += chunk; });
+      req.on('end', function() {
+        try {
+          const { content } = JSON.parse(body);
+          if (typeof content !== 'string') { sendJson(res, 400, { error: 'content must be a string' }); return; }
+          fs.mkdirSync(path.dirname(GUIDELINES_FILE), { recursive: true });
+          fs.writeFileSync(GUIDELINES_FILE, content, 'utf8');
+          sendJson(res, 200, { ok: true });
+        } catch (e) {
+          sendJson(res, 400, { error: 'Invalid request body' });
+        }
+      });
+      return;
+    }
+
+    // ── POST /ai/scan ────────────────────────────────────────────────────────
+    // Accepts text nodes from a frame, checks against guidelines via configured AI provider.
+    // Body: { textNodes: [{ id, name, characters, path }] }
+    if (req.method === 'POST' && url.pathname === '/ai/scan') {
+      const user = getUserFromRequest(req);
+      if (!user) { sendJson(res, 401, { error: 'Unauthorized' }); return; }
+      let body = '';
+      req.on('data', function(chunk) { body += chunk; });
+      req.on('end', async function() {
+        try {
+          const { textNodes } = JSON.parse(body);
+          if (!Array.isArray(textNodes) || textNodes.length === 0) {
+            sendJson(res, 400, { error: 'textNodes array is required' });
+            return;
+          }
+
+          const cfg = loadAiConfig();
+          if (!cfg.provider) {
+            sendJson(res, 400, { error: 'AI provider not configured. Set it in plugin settings.' });
+            return;
+          }
+
+          let guidelines = '';
+          try { guidelines = fs.readFileSync(GUIDELINES_FILE, 'utf8'); } catch (_) {}
+          if (!guidelines.trim()) {
+            sendJson(res, 400, { error: 'No content guidelines found. Upload guidelines in plugin settings.' });
+            return;
+          }
+
+          const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
+          const issues = await runAiContentScan(cfg, model, guidelines, textNodes);
+          sendJson(res, 200, { ok: true, issues });
+        } catch (e) {
+          sendJson(res, 500, { error: e.message || 'AI scan failed' });
+        }
+      });
+      return;
+    }
+
     sendJson(res, 404, { error: 'Not found' });
   } catch (error) {
     sendJson(res, 500, { error: error.message || 'Unknown error' });
   }
+}
+
+// ── AI provider router ────────────────────────────────────────────────────────
+// Sends text content + guidelines to the configured AI provider.
+// Returns array of { layerName, path, issue, suggestion } objects.
+async function runAiContentScan(cfg, model, guidelines, textNodes) {
+  const textSummary = textNodes
+    .map(function(n) { return '- [' + n.path + '] ' + JSON.stringify(n.characters); })
+    .join('\n');
+
+  const prompt = [
+    'You are a design content reviewer. Check the following text content from a design file against the provided guidelines.',
+    '',
+    '## Content Guidelines',
+    guidelines,
+    '',
+    '## Text Content from Design (format: [layer path] "text")',
+    textSummary,
+    '',
+    'Return ONLY a JSON array of issues. Each issue must have:',
+    '- "layerPath": the layer path from the list above',
+    '- "characters": the exact text that has the issue',
+    '- "issue": a short description of what violates the guideline',
+    '- "suggestion": a concrete suggested fix',
+    '',
+    'If there are no issues, return an empty array []. Return only valid JSON, no explanation.',
+  ].join('\n');
+
+  if (cfg.authMethod === 'cli') {
+    return await runAiScanCLI(cfg.provider, model, prompt);
+  }
+  if (cfg.provider === 'anthropic') {
+    return await runAiScanAnthropic(cfg.apiKey, model, prompt);
+  } else if (cfg.provider === 'openai') {
+    return await runAiScanOpenAI(cfg.apiKey, model, prompt);
+  } else if (cfg.provider === 'google') {
+    return await runAiScanGoogle(cfg.apiKey, model, prompt);
+  } else if (cfg.provider === 'ollama') {
+    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt);
+  }
+  throw new Error('Unknown AI provider: ' + cfg.provider);
+}
+
+// parseAiJsonResponse: extracts a JSON array from an AI response string; returns [] on parse failure.
+function parseAiJsonResponse(text) {
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  try { return JSON.parse(match[0]); } catch (_) { return []; }
+}
+
+// runAiScanAnthropic: calls Anthropic Messages API with the given prompt; returns parsed issues array.
+async function runAiScanAnthropic(apiKey, model, prompt) {
+  const res = await fetchJson('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: model,
+      max_tokens: 2048,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+  const text = res && res.content && res.content[0] && res.content[0].text || '';
+  return parseAiJsonResponse(text);
+}
+
+// runAiScanOpenAI: calls OpenAI Chat Completions API; returns parsed issues array.
+async function runAiScanOpenAI(apiKey, model, prompt) {
+  const res = await fetchJson('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+    body: JSON.stringify({
+      model: model,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 2048,
+    }),
+  });
+  const text = res && res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content || '';
+  return parseAiJsonResponse(text);
+}
+
+// runAiScanGoogle: calls Google Generative Language API (Gemini); returns parsed issues array.
+async function runAiScanGoogle(apiKey, model, prompt) {
+  const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey;
+  const res = await fetchJson(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+  });
+  const text = res && res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts && res.candidates[0].content.parts[0] && res.candidates[0].content.parts[0].text || '';
+  return parseAiJsonResponse(text);
+}
+
+// runAiScanOllama: calls a local Ollama instance; returns parsed issues array.
+async function runAiScanOllama(endpoint, model, prompt) {
+  const res = await fetchJson(endpoint + '/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: model,
+      messages: [{ role: 'user', content: prompt }],
+      stream: false,
+    }),
+  });
+  const text = res && res.message && res.message.content || '';
+  return parseAiJsonResponse(text);
+}
+
+// ── CLI subscription helpers ───────────────────────────────────────────────────
+// Spawns a CLI process, writes the prompt via stdin, and returns stdout as text.
+function spawnCli(cmd, args, stdinData) {
+  return new Promise(function(resolve, reject) {
+    var child = spawn(cmd, args, { env: process.env });
+    var stdout = '';
+    var stderr = '';
+    child.stdout.on('data', function(d) { stdout += d.toString(); });
+    child.stderr.on('data', function(d) { stderr += d.toString(); });
+    child.on('error', function() {
+      reject(new Error(cmd + ' CLI not found. Install it and log in.'));
+    });
+    child.on('close', function(code) {
+      if (!stdout.trim() && code !== 0) {
+        reject(new Error(cmd + ' exited with code ' + code + '. Make sure you are logged in.'));
+      } else {
+        resolve(stdout);
+      }
+    });
+    if (stdinData) {
+      try { child.stdin.write(stdinData); child.stdin.end(); } catch (_) {}
+    }
+  });
+}
+
+// Returns true if the given CLI command exists on PATH.
+function isCliInstalled(cmd) {
+  return new Promise(function(resolve) {
+    var which = process.platform === 'win32' ? 'where' : 'which';
+    execFile(which, [cmd], function(err) { resolve(!err); });
+  });
+}
+
+// Returns true if the given provider's CLI is authenticated.
+async function checkCliAuth(provider) {
+  try {
+    if (provider === 'anthropic') {
+      return await new Promise(function(resolve) {
+        execFile('claude', ['auth', 'status'], { timeout: 5000 }, function(err) { resolve(!err); });
+      });
+    }
+    if (provider === 'google') {
+      var geminiAuthOk = await new Promise(function(resolve) {
+        execFile('gemini', ['auth', 'status'], { timeout: 5000 }, function(err) { resolve(!err); });
+      });
+      if (geminiAuthOk) return true;
+      var geminiFiles = [
+        path.join(os.homedir(), '.gemini', 'oauth_creds.json'),
+        path.join(os.homedir(), '.gemini', 'auth.json'),
+      ];
+      return geminiFiles.some(function(p) {
+        try { return !!JSON.parse(fs.readFileSync(p, 'utf8')); } catch (_) { return false; }
+      });
+    }
+    if (provider === 'openai') {
+      var codexFiles = [
+        path.join(os.homedir(), '.codex', 'auth.json'),
+        path.join(os.homedir(), '.config', 'codex', 'auth.json'),
+      ];
+      return codexFiles.some(function(p) {
+        try { return !!JSON.parse(fs.readFileSync(p, 'utf8')); } catch (_) { return false; }
+      });
+    }
+    return false;
+  } catch (_) { return false; }
+}
+
+// Routes a CLI subscription scan to the correct CLI binary for the provider.
+// Prompt is passed via stdin; model is passed via --model flag where supported.
+async function runAiScanCLI(provider, model, prompt) {
+  var cliConfigs = {
+    anthropic: { cmd: 'claude', args: ['-p', '--bare', '--no-session-persistence'] },
+    google:    { cmd: 'gemini', args: ['-p'] },
+    openai:    { cmd: 'codex',  args: ['exec', '-', '--ephemeral'] },
+  };
+  var cli = cliConfigs[provider];
+  if (!cli) throw new Error('CLI subscription is not supported for provider: ' + provider + '. Use API Key mode instead.');
+  var args = model ? cli.args.concat(['--model', model]) : cli.args;
+  var stdout = await spawnCli(cli.cmd, args, prompt);
+  return parseAiJsonResponse(stdout);
 }
 
 function findAvailablePort(preferred) {
