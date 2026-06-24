@@ -2030,8 +2030,32 @@ function isCliInstalled(cmd) {
 async function checkCliAuth(provider) {
   try {
     if (provider === 'anthropic') {
+      // claude auth status reads from disk and can report "logged in" even when the session is expired.
+      // Do a real test call to confirm the CLI actually works; kill on first stdout line or 12s timeout.
       return await new Promise(function(resolve) {
-        execFile('claude', ['auth', 'status'], { timeout: 5000 }, function(err) { resolve(!err); });
+        var child = spawn('claude', ['-p', '--no-session-persistence'], { env: process.env });
+        var stdout = '';
+        var stderr = '';
+        var done = false;
+        function finish(result) {
+          if (done) return;
+          done = true;
+          try { child.kill(); } catch (_) {}
+          resolve(result);
+        }
+        child.stdout.on('data', function(d) {
+          stdout += d.toString();
+          var out = stdout.toLowerCase();
+          if (out.includes('not logged in') || out.includes('please run')) finish(false);
+          else if (stdout.trim().length > 0) finish(true);
+        });
+        child.stderr.on('data', function(d) { stderr += d.toString(); });
+        child.on('error', function() { finish(false); });
+        child.on('close', function(code) {
+          if (!done) finish(code === 0 && !stdout.toLowerCase().includes('not logged in'));
+        });
+        setTimeout(function() { finish(false); }, 12000);
+        try { child.stdin.write('1'); child.stdin.end(); } catch (_) { finish(false); }
       });
     }
     if (provider === 'google') {
