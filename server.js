@@ -1251,6 +1251,10 @@ async function requestHandler(req, res) {
         sendJson(res, 400, { ok: false, error: 'Missing fileKey parameter' });
         return;
       }
+      if (!hasFigmaAuth(req)) {
+        sendJson(res, 401, { ok: false, error: 'No Figma authentication available. Sign in via OAuth or configure FIGMA_PAT.' });
+        return;
+      }
 
       const figmaHeaders = await getFigmaAuthHeaders(req);
       const headers = figmaHeaders;
@@ -2108,8 +2112,8 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     'Return ONLY a JSON array of issues. Each issue must have:',
     '- "layerPath": the layer path from the list above',
     '- "characters": the exact text that has the issue',
-    '- "issue": ONE sentence, max 12 words. State only the violation. No conjunctions, no "also", no extra context.',
-    '- "suggestion": ONE sentence, max 12 words. Give the fix or an example replacement.',
+    '- "issue": ONE sentence, max 24 words. State only the violation. No conjunctions, no "also", no extra context.',
+    '- "suggestion": ONE sentence, max 24 words. Give the fix or an example replacement.',
     '- "rule": 2-4 words naming the specific guideline violated. Examples: "Sentence case", "Banned term", "CTA specificity", "Second person", "Oxford comma".',
     '- "severity": "error" (clear rule violation) | "warning" (judgment call) | "suggestion" (optional improvement).',
     '- "replacement": the exact corrected text string only — just the fixed version of "characters", nothing else. Omit this field entirely if no clean single replacement exists.',
