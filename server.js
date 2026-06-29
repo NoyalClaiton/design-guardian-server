@@ -2006,6 +2006,30 @@ async function requestHandler(req, res) {
       return;
     }
 
+    // ── POST /ai/normalize ───────────────────────────────────────────────────
+    // Normalizes rule names and severity levels across issues found in parallel
+    // frame scans. Accepts raw AI issues and returns a consistent set.
+    // Body: { issues: [...rawAiIssues] }
+    if (req.method === 'POST' && url.pathname === '/ai/normalize') {
+      const normChunks = [];
+      req.on('data', function(chunk) { normChunks.push(chunk); });
+      req.on('end', async function() {
+        try {
+          const body = JSON.parse(Buffer.concat(normChunks).toString('utf8'));
+          const issues = Array.isArray(body.issues) ? body.issues : [];
+          if (issues.length === 0) { sendJson(res, 200, { ok: true, issues: [] }); return; }
+          const cfg = loadAiConfig();
+          if (!cfg.provider) { sendJson(res, 400, { error: 'AI provider not configured' }); return; }
+          const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
+          const normalized = await runAiNormalizationPass(cfg, model, issues);
+          sendJson(res, 200, { ok: true, issues: normalized });
+        } catch (e) {
+          sendJson(res, 500, { error: e.message || 'Normalization failed' });
+        }
+      });
+      return;
+    }
+
     // ── POST /add-comment ────────────────────────────────────────────────────
     // Posts a Figma comment on a specific node using the user's PAT.
     // Body: { fileKey, nodeId, message, x, y }
@@ -2140,6 +2164,61 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt);
   }
   throw new Error('Unknown AI provider: ' + cfg.provider);
+}
+
+// runAiNormalizationPass: takes raw AI issues from parallel frame scans and normalizes rule names
+// and severity for consistency. Only modifies 'rule' and 'severity' — all other fields are preserved.
+async function runAiNormalizationPass(cfg, model, issues) {
+  const rulesInput = issues.map(function(iss, i) {
+    return i + '|' + JSON.stringify(iss.rule || 'General') + '|' + (iss.severity || 'warning');
+  }).join('\n');
+
+  const prompt = [
+    'You are a content review editor. Issues below were found across multiple Figma frames reviewed in parallel.',
+    'Because frames were reviewed independently, the same type of violation may have inconsistent rule names or severity.',
+    '',
+    '## Your task',
+    'Return a JSON array normalizing ONLY the `rule` and `severity` fields:',
+    '- Merge synonymous rule names into one consistent name (e.g. "Sentence case violation" and "sentence case" → "Sentence case")',
+    '- Use sentence case for all rule names (capitalize first word only, no trailing period)',
+    '- Make severity consistent per rule type: "error" = clear rule violation, "warning" = judgment call, "suggestion" = optional',
+    '',
+    '## Issues (format: index|rule|severity)',
+    rulesInput,
+    '',
+    'Return ONLY a JSON array of { "index": N, "rule": "Normalized rule", "severity": "normalized" }.',
+    'One entry per line of input, in the same order. Return only valid JSON, no explanation.',
+  ].join('\n');
+
+  let rawResult;
+  if (cfg.authMethod === 'cli') {
+    rawResult = await runAiScanCLI(cfg.provider, model, prompt);
+  } else if (cfg.provider === 'anthropic') {
+    rawResult = await runAiScanAnthropic(cfg.apiKey, model, prompt);
+  } else if (cfg.provider === 'openai') {
+    rawResult = await runAiScanOpenAI(cfg.apiKey, model, prompt);
+  } else if (cfg.provider === 'google') {
+    rawResult = await runAiScanGoogle(cfg.apiKey, model, prompt);
+  } else if (cfg.provider === 'ollama') {
+    rawResult = await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt);
+  } else {
+    return issues;
+  }
+
+  if (!Array.isArray(rawResult) || rawResult.length === 0) return issues;
+  // Build an index map from the AI response so position reordering can't mis-assign fields.
+  const normByIndex = {};
+  rawResult.forEach(function(norm) {
+    if (norm && typeof norm.index === 'number') normByIndex[norm.index] = norm;
+  });
+  // Merge normalized rule/severity back; preserve all other fields from original issues.
+  return issues.map(function(orig, i) {
+    const norm = normByIndex[i];
+    return Object.assign({}, orig, {
+      rule: (norm && typeof norm.rule === 'string' && norm.rule.trim()) ? norm.rule.trim() : orig.rule,
+      severity: (norm && (norm.severity === 'error' || norm.severity === 'warning' || norm.severity === 'suggestion')) ? norm.severity : orig.severity,
+    });
+  });
 }
 
 // parseAiJsonResponse: extracts a JSON array from an AI response string; returns [] on parse failure.
