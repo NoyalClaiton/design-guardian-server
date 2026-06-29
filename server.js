@@ -2359,7 +2359,11 @@ function tryGenerateCertsWithMkcert() {
   // -install adds the local CA to the system trust store; needs sudo on macOS so inherit stdio for the password prompt
   console.log('[Design Guardian] Installing local CA via mkcert (you may be prompted for your password)...');
   var install = spawnSync('mkcert', ['-install'], { stdio: 'inherit', timeout: 60000 });
-  if (install.error) return false;
+  // Check both spawn error AND exit code — non-zero means user denied the password prompt or install failed
+  if (install.error || install.status !== 0) {
+    console.log('[Design Guardian] mkcert -install failed or was cancelled. HTTPS cert will not be trusted.');
+    return false;
+  }
   var gen = spawnSync('mkcert', ['design-guardian.local', 'localhost', '127.0.0.1'], { cwd: __dirname, stdio: 'pipe', timeout: 30000 });
   return !gen.error && gen.status === 0;
 }
@@ -2370,7 +2374,7 @@ function tryGenerateCertsWithMkcert() {
 // generated, so -install was never run and the root CA was never added to the trust store).
 function isCertTrusted(cert) {
   var carootResult = spawnSync('mkcert', ['-CAROOT'], { stdio: 'pipe' });
-  if (carootResult.error || carootResult.status !== 0) return true; // mkcert gone — assume ok, handle below
+  if (carootResult.error || carootResult.status !== 0) return false; // mkcert gone or broken — cert cannot be verified as trusted
   var caroot = carootResult.stdout.toString().trim();
   var caFile = path.join(caroot, 'rootCA.pem');
   if (!fs.existsSync(caFile)) return false;
