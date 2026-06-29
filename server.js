@@ -78,6 +78,22 @@ const AI_CONFIG_FILE = process.env.AI_CONFIG_FILE ||
 const GUIDELINES_FILE = process.env.GUIDELINES_FILE ||
   (process.env.RAILWAY_ENVIRONMENT ? '/data/content-guidelines.md' : path.join(__dirname, 'content-guidelines.md'));
 
+// Default AI persona — sent as the opening instruction in every content scan prompt.
+// Users can override this via the plugin UI; an empty string in ai-config.json means "use default".
+const DEFAULT_AI_PERSONA = [
+  'You are a design content reviewer. Check the text content below against the provided guidelines.',
+  '',
+  'SKIP these — they are Figma component scaffolding with no product meaning:',
+  '- Text that is literally a single generic word used as a UI element name: "Slot", "Text", "Checkbox", "Toggle"',
+  '- Instructional Figma layer labels like "Swap me with your body component." or "Copy me -> detach me"',
+  '- Pure numeric values like "20" used as counters or badges with no surrounding context',
+  '',
+  'DO evaluate these — they are real product copy regardless of where they appear:',
+  '- Any text a designer clearly wrote for end users: headings, descriptions, error messages, empty states, CTAs',
+  '- Button labels, even short ones — especially check capitalisation (e.g. "ACTION" should be sentence case if guidelines require it)',
+  '- Any word or phrase that is not literally the name of a UI component type',
+].join('\n');
+
 // Default models per provider — used when no model is explicitly saved in ai-config.json.
 const AI_DEFAULT_MODELS = {
   anthropic: 'claude-haiku-4-5-20251001',
@@ -206,6 +222,28 @@ function getUserFromRequest(req) {
   } catch (_) {
     return null;
   }
+}
+
+// getFigmaAuthHeaders: returns the correct Figma API auth headers for this request.
+// Cloud mode: uses the signed-in user's OAuth access token (via Bearer JWT).
+// Local mode: falls back to the FIGMA_PAT environment variable.
+async function getFigmaAuthHeaders(req) {
+  const user = getUserFromRequest(req);
+  if (user) {
+    try {
+      const token = await getFigmaToken(user);
+      if (token) return { 'Authorization': 'Bearer ' + token };
+    } catch (e) {
+      console.warn('[getFigmaAuthHeaders] OAuth token error for user', user.id, ':', e.message);
+    }
+  }
+  return { 'X-Figma-Token': FIGMA_PAT || '' };
+}
+
+// hasFigmaAuth: true if the request can authenticate Figma API calls.
+// Accepts either a signed-in OAuth user (JWT) or a configured FIGMA_PAT.
+function hasFigmaAuth(req) {
+  return Boolean(getUserFromRequest(req)) || Boolean(FIGMA_PAT);
 }
 
 // ── Figma token refresh ───────────────────────────────────────────────────────
@@ -346,7 +384,7 @@ function sendJson(res, status, data) {
     'Content-Type': 'application/json',
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Allow-Private-Network': 'true'
   });
@@ -374,7 +412,8 @@ async function fetchJson(url, options = {}) {
     }
 
     if (!response.ok) {
-      throw new Error(json?.err || json?.message || json?.error || `HTTP ${response.status}: ${JSON.stringify(json)}`);
+      const detail = json?.err || json?.message || json?.error || JSON.stringify(json);
+      throw new Error(`Figma API ${response.status}: ${detail}`);
     }
 
     return json;
@@ -792,14 +831,11 @@ async function fetchComponentSignatures(fileKey, componentNodeIds, headers, comp
 
 // getLibraryData: fetches all component/style/variable data for a library file from the Figma API.
 // Returns normalized library object; Phase 2 (signatures) runs in the background after Phase 1 returns.
-async function getLibraryData(fileKeyRaw, normalizedKey, previousData) {
+async function getLibraryData(fileKeyRaw, normalizedKey, previousData, figmaHeaders) {
   const fileKey = normalizeFileKey(fileKeyRaw);
   if (!fileKey) throw new Error('Missing file key');
 
-
-  const headers = {
-    'X-Figma-Token': FIGMA_PAT
-  };
+  const headers = figmaHeaders || { 'X-Figma-Token': FIGMA_PAT || '' };
 
   // Phase 1: 5 parallel calls — file metadata (depth=1 for info, depth=2 for document tree) + components + styles + variables
   // depth=1: metadata-only (name, lastModified, thumbnailUrl, version)
@@ -1188,7 +1224,7 @@ async function requestHandler(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type,Authorization',
       'Access-Control-Allow-Private-Network': 'true'
     });
@@ -1216,9 +1252,8 @@ async function requestHandler(req, res) {
         return;
       }
 
-      const headers = {
-        'X-Figma-Token': FIGMA_PAT
-      };
+      const figmaHeaders = await getFigmaAuthHeaders(req);
+      const headers = figmaHeaders;
 
       // Check cache for library status using publish-date validation
       const cacheHit = libraryCache.has(normalizedKey);
@@ -1325,7 +1360,7 @@ async function requestHandler(req, res) {
           activeSyncs.add(normalizedKey);
           const _syncStart = Date.now();
           console.log('[Sync] Started  key=' + shortKey(normalizedKey));
-          getLibraryData(fileKey, normalizedKey)
+          getLibraryData(fileKey, normalizedKey, undefined, figmaHeaders)
             .then(data => {
               cacheSet(normalizedKey, data);
               console.log('[Sync] Complete key=' + shortKey(normalizedKey) + ' (' + ((Date.now() - _syncStart) / 1000).toFixed(1) + 's)');
@@ -1363,18 +1398,16 @@ async function requestHandler(req, res) {
 
     if (req.method === 'GET' && url.pathname === '/library') {
       const requestReceivedTime = Date.now();
-      if (!FIGMA_PAT) {
-        sendJson(res, 500, { error: 'FIGMA_PAT environment variable is not set' });
+      if (!hasFigmaAuth(req)) {
+        sendJson(res, 500, { error: 'No Figma authentication available. Sign in via OAuth or configure FIGMA_PAT.' });
         return;
       }
 
       const fileKey = url.searchParams.get('fileKey');
       const fresh = url.searchParams.get('fresh') === 'true';
 
-
-      const headers = {
-        'X-Figma-Token': FIGMA_PAT
-      };
+      const figmaHeaders = await getFigmaAuthHeaders(req);
+      const headers = figmaHeaders;
 
       try {
         const normalizedKey = normalizeFileKey(fileKey);
@@ -1438,7 +1471,7 @@ async function requestHandler(req, res) {
           libraryCache.delete(normalizedKey);
         }
 
-        const data = await getLibraryData(fileKey, normalizedKey, previousData);
+        const data = await getLibraryData(fileKey, normalizedKey, previousData, figmaHeaders);
 
         // Store in cache (uses LRU eviction if needed)
         cacheSet(normalizedKey, data);
@@ -1454,8 +1487,8 @@ async function requestHandler(req, res) {
     }
 
     if (req.method === 'GET' && url.pathname === '/verify-component') {
-      if (!FIGMA_PAT) {
-        sendJson(res, 500, { error: 'FIGMA_PAT environment variable is not set' });
+      if (!hasFigmaAuth(req)) {
+        sendJson(res, 500, { error: 'No Figma authentication available. Sign in via OAuth or configure FIGMA_PAT.' });
         return;
       }
 
@@ -1465,9 +1498,10 @@ async function requestHandler(req, res) {
         return;
       }
 
+      const figmaHeaders = await getFigmaAuthHeaders(req);
       const result = await fetchJsonOptional(
         `https://api.figma.com/v1/components/${componentKey}`,
-        { headers: { 'X-Figma-Token': FIGMA_PAT } }
+        { headers: figmaHeaders }
       );
 
       if (!result.ok) {
@@ -1485,14 +1519,15 @@ async function requestHandler(req, res) {
     // Batch verification: verify multiple component keys in parallel.
     // Reduces 147 individual requests to ~5-10 batch requests on large files.
     if (req.method === 'POST' && url.pathname === '/verify-components') {
-      if (!FIGMA_PAT) {
-        sendJson(res, 500, { error: 'FIGMA_PAT environment variable is not set' });
+      if (!hasFigmaAuth(req)) {
+        sendJson(res, 500, { error: 'No Figma authentication available. Sign in via OAuth or configure FIGMA_PAT.' });
         return;
       }
 
       let body = '';
       req.on('data', chunk => { body += chunk.toString(); });
       req.on('end', async () => {
+        const figmaHeaders = await getFigmaAuthHeaders(req);
         try {
           const { keys } = JSON.parse(body);
           if (!Array.isArray(keys) || keys.length === 0) {
@@ -1538,7 +1573,7 @@ async function requestHandler(req, res) {
             const results = await Promise.all(batch.map(key =>
               fetchJsonOptional(
                 `https://api.figma.com/v1/components/${key}`,
-                { headers: { 'X-Figma-Token': FIGMA_PAT } }
+                { headers: figmaHeaders }
               )
             ));
 
@@ -1597,6 +1632,45 @@ async function requestHandler(req, res) {
       const cachedLastPublished = cached.data.lastPublished || null;
       const changed = !pluginLastPublished || !cachedLastPublished || pluginLastPublished !== cachedLastPublished;
       sendJson(res, 200, { ok: true, lastPublished: cachedLastPublished, changed: changed, reason: changed ? 'lastPublished-differs' : 'up-to-date' });
+      return;
+    }
+
+    // ── GET /validate-file?fileKey=xxx ────────────────────────────────────────
+    // Lightweight upfront check: can the server access this Figma file?
+    // Returns { ok, name } on success or { ok: false, error } on failure.
+    // Uses a 10s timeout so the modal stays responsive.
+    if (req.method === 'GET' && url.pathname === '/validate-file') {
+      const fileKey = url.searchParams.get('fileKey');
+      const normalizedKey = normalizeFileKey(fileKey);
+      if (!normalizedKey) {
+        sendJson(res, 400, { ok: false, error: 'Missing or invalid file key' });
+        return;
+      }
+      if (!hasFigmaAuth(req)) {
+        sendJson(res, 200, { ok: false, error: 'No Figma authentication available. Sign in via OAuth or configure FIGMA_PAT.' });
+        return;
+      }
+      const figmaHeaders = await getFigmaAuthHeaders(req);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch(
+          `https://api.figma.com/v1/files/${normalizedKey}?depth=1`,
+          { headers: figmaHeaders, signal: controller.signal }
+        );
+        clearTimeout(timer);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const errDetail = data?.err || data?.message || data?.error || `HTTP ${response.status}`;
+          sendJson(res, 200, { ok: false, error: `Cannot access file: ${errDetail}` });
+          return;
+        }
+        sendJson(res, 200, { ok: true, name: data.name || 'Untitled' });
+      } catch (e) {
+        clearTimeout(timer);
+        const msg = e.name === 'AbortError' ? 'Timed out checking file' : 'Could not reach Figma API';
+        sendJson(res, 200, { ok: false, error: msg });
+      }
       return;
     }
 
@@ -1734,6 +1808,8 @@ async function requestHandler(req, res) {
         ollamaEndpoint: cfg.ollamaEndpoint || 'http://localhost:11434',
         hasApiKey: !!(cfg.apiKey),
         defaultModels: AI_DEFAULT_MODELS,
+        persona: cfg.persona || '',
+        defaultPersona: DEFAULT_AI_PERSONA,
       });
       return;
     }
@@ -1741,21 +1817,24 @@ async function requestHandler(req, res) {
     // ── POST /ai/config ──────────────────────────────────────────────────────
     // Saves AI provider config. No auth — self-hosted server is user-owned.
     if (req.method === 'POST' && url.pathname === '/ai/config') {
-      let body = '';
-      req.on('data', function(chunk) { body += chunk; });
+      const chunks = [];
+      req.on('data', function(chunk) { chunks.push(chunk); });
       req.on('end', function() {
+        const body = Buffer.concat(chunks).toString('utf8');
         try {
           const incoming = JSON.parse(body);
           const existing = loadAiConfig();
           const updated = {
             provider: incoming.provider || existing.provider || '',
             model: incoming.model || existing.model || '',
-            authMethod: incoming.authMethod || existing.authMethod || 'apikey',
+            authMethod: incoming.authMethod || existing.authMethod || 'cli',
             ollamaEndpoint: incoming.ollamaEndpoint || existing.ollamaEndpoint || 'http://localhost:11434',
             // Only update apiKey if a new one was sent; empty string means "keep existing"
             apiKey: incoming.apiKey !== undefined && incoming.apiKey !== ''
               ? incoming.apiKey
               : (existing.apiKey || ''),
+            // Empty string means "use default persona" — preserve that intent explicitly
+            persona: typeof incoming.persona === 'string' ? incoming.persona : (existing.persona || ''),
           };
           saveAiConfig(updated);
           sendJson(res, 200, { ok: true });
@@ -1785,21 +1864,41 @@ async function requestHandler(req, res) {
     // Spawns the provider's CLI login process detached so it opens a browser
     // OAuth flow on the user's machine. Returns immediately — login is async.
     if (req.method === 'POST' && url.pathname === '/ai/cli-login') {
-      let body = '';
-      req.on('data', function(chunk) { body += chunk; });
-      req.on('end', function() {
+      const chunks = [];
+      req.on('data', function(chunk) { chunks.push(chunk); });
+      req.on('end', async function() {
+        const body = Buffer.concat(chunks).toString('utf8');
         try {
           const { provider } = JSON.parse(body);
+          // Login command per provider:
+          // - claude auth login: opens browser for Claude.ai / SSO auth (correct subcommand).
+          // - gemini: no standalone login; open gemini REPL and user types /auth inside.
+          // - codex login: explicit subcommand that opens a browser OAuth flow.
           const loginCmds = {
-            anthropic: ['claude', 'login'],
-            google:    ['gemini', 'auth', 'login'],
+            anthropic: ['claude', 'auth', 'login'],
+            google:    ['gemini'],
             openai:    ['codex', 'login'],
+          };
+          const installUrls = {
+            anthropic: 'https://docs.anthropic.com/claude-code',
+            google:    'https://ai.google.dev/gemini-api/docs/gemini-cli',
+            openai:    'https://github.com/openai/codex',
           };
           const cmd = loginCmds[provider];
           if (!cmd) { sendJson(res, 400, { error: 'No login command for provider: ' + provider }); return; }
-          // Spawn detached so the server doesn't block waiting for OAuth to complete
-          const child = spawn(cmd[0], cmd.slice(1), { detached: true, stdio: 'ignore' });
-          child.on('error', function() {});
+          // Check the binary is actually installed before trying to spawn
+          const installed = await isCliInstalled(cmd[0]);
+          if (!installed) {
+            sendJson(res, 400, {
+              error: '"' + cmd[0] + '" CLI is not installed. Install it first: ' + (installUrls[provider] || 'check provider docs'),
+            });
+            return;
+          }
+          // Spawn detached and inherit server stdio so the child process can open a browser.
+          const child = spawn(cmd[0], cmd.slice(1), { detached: true, stdio: 'inherit' });
+          child.on('error', function(err) {
+            console.error('[cli-login] spawn error for "' + cmd.join(' ') + '":', err.message);
+          });
           child.unref();
           sendJson(res, 200, { ok: true });
         } catch (e) {
@@ -1810,30 +1909,50 @@ async function requestHandler(req, res) {
     }
 
     // ── GET /ai/guidelines ───────────────────────────────────────────────────
+    // Returns { content, files, manual } so the UI can restore uploaded file cards.
     if (req.method === 'GET' && url.pathname === '/ai/guidelines') {
       try {
-        const content = fs.readFileSync(GUIDELINES_FILE, 'utf8');
-        sendJson(res, 200, { ok: true, content });
+        const raw = fs.readFileSync(GUIDELINES_FILE, 'utf8');
+        let data;
+        try { data = JSON.parse(raw); } catch (_) { data = null; }
+        if (!data || typeof data !== 'object') {
+          // Legacy plain-text format: surface as a synthetic file card so the UI shows it
+          // as an uploaded file (not manual text). Avoids the loop where plain-text content
+          // fills the manual textarea and gets re-saved as manual on every interaction.
+          const lines = raw.split('\n').length;
+          const legacyFile = { name: 'content-guidelines.md', content: raw, lines: lines, enabled: true };
+          sendJson(res, 200, { ok: true, content: raw, files: [legacyFile], manual: '' });
+        } else {
+          sendJson(res, 200, { ok: true, content: data.content || '', files: data.files || [], manual: data.manual || '' });
+        }
       } catch (_) {
-        sendJson(res, 200, { ok: true, content: '' });
+        sendJson(res, 200, { ok: true, content: '', files: [], manual: '' });
       }
       return;
     }
 
     // ── POST /ai/guidelines ──────────────────────────────────────────────────
-    // Saves content guidelines. No auth — self-hosted server is user-owned.
+    // Accepts { files: [{name,content,lines,enabled}], manual: string }.
+    // Merges into a single content string for AI scans and stores all three.
     if (req.method === 'POST' && url.pathname === '/ai/guidelines') {
-      let body = '';
-      req.on('data', function(chunk) { body += chunk; });
+      const chunks = [];
+      req.on('data', function(chunk) { chunks.push(chunk); });
       req.on('end', function() {
+        const body = Buffer.concat(chunks).toString('utf8');
         try {
-          const { content } = JSON.parse(body);
-          if (typeof content !== 'string') { sendJson(res, 400, { error: 'content must be a string' }); return; }
+          const payload = JSON.parse(body);
+          const files = Array.isArray(payload.files) ? payload.files : [];
+          const manual = typeof payload.manual === 'string' ? payload.manual.trim() : '';
+          const fileContent = files.filter(function(f) { return f.enabled !== false; })
+            .map(function(f) { return '--- ' + f.name + ' ---\n' + (f.content || ''); }).join('\n\n');
+          const content = fileContent && manual ? fileContent + '\n\n--- Manual ---\n' + manual
+            : fileContent || manual;
           fs.mkdirSync(path.dirname(GUIDELINES_FILE), { recursive: true });
-          fs.writeFileSync(GUIDELINES_FILE, content, 'utf8');
+          fs.writeFileSync(GUIDELINES_FILE, JSON.stringify({ content, files, manual }), 'utf8');
           sendJson(res, 200, { ok: true });
         } catch (e) {
-          sendJson(res, 400, { error: 'Invalid request body' });
+          console.error('[Design Guardian] POST /ai/guidelines error:', e.message);
+          sendJson(res, 500, { error: e.message || 'Failed to save guidelines' });
         }
       });
       return;
@@ -1841,13 +1960,13 @@ async function requestHandler(req, res) {
 
     // ── POST /ai/scan ────────────────────────────────────────────────────────
     // Accepts text nodes from a frame, checks against guidelines via configured AI provider.
+    // No auth — self-hosted server is user-owned (consistent with /ai/config, /ai/guidelines).
     // Body: { textNodes: [{ id, name, characters, path }] }
     if (req.method === 'POST' && url.pathname === '/ai/scan') {
-      const user = getUserFromRequest(req);
-      if (!user) { sendJson(res, 401, { error: 'Unauthorized' }); return; }
-      let body = '';
-      req.on('data', function(chunk) { body += chunk; });
+      const chunks = [];
+      req.on('data', function(chunk) { chunks.push(chunk); });
       req.on('end', async function() {
+        const body = Buffer.concat(chunks).toString('utf8');
         try {
           const { textNodes } = JSON.parse(body);
           if (!Array.isArray(textNodes) || textNodes.length === 0) {
@@ -1862,7 +1981,12 @@ async function requestHandler(req, res) {
           }
 
           let guidelines = '';
-          try { guidelines = fs.readFileSync(GUIDELINES_FILE, 'utf8'); } catch (_) {}
+          try {
+            const raw = fs.readFileSync(GUIDELINES_FILE, 'utf8');
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+            guidelines = (parsed && typeof parsed.content === 'string') ? parsed.content : raw;
+          } catch (_) {}
           if (!guidelines.trim()) {
             sendJson(res, 400, { error: 'No content guidelines found. Upload guidelines in plugin settings.' });
             return;
@@ -1873,6 +1997,85 @@ async function requestHandler(req, res) {
           sendJson(res, 200, { ok: true, issues, meta: { provider: cfg.provider, model, nodeCount: textNodes.length } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'AI scan failed' });
+        }
+      });
+      return;
+    }
+
+    // ── POST /add-comment ────────────────────────────────────────────────────
+    // Posts a Figma comment on a specific node using the user's PAT.
+    // Body: { fileKey, nodeId, message, x, y }
+    if (req.method === 'POST' && url.pathname === '/add-comment') {
+      if (!hasFigmaAuth(req)) {
+        sendJson(res, 500, { error: 'No Figma authentication available. Sign in via OAuth or configure FIGMA_PAT.' });
+        return;
+      }
+      const chunks = [];
+      req.on('data', function(chunk) { chunks.push(chunk); });
+      req.on('end', async function() {
+        const figmaHeaders = await getFigmaAuthHeaders(req);
+        const body = Buffer.concat(chunks).toString('utf8');
+        try {
+          const { fileKey, nodeId, x, y, message } = JSON.parse(body);
+          if (!fileKey) { sendJson(res, 400, { error: 'fileKey is required' }); return; }
+          if (!message) { sendJson(res, 400, { error: 'message is required' }); return; }
+
+          const commentBody = { message, client_meta: { x: Math.round(x || 0), y: Math.round(y || 0) } };
+
+          const result = await fetchJson(
+            `https://api.figma.com/v1/files/${fileKey}/comments`,
+            {
+              method: 'POST',
+              headers: Object.assign({}, figmaHeaders, { 'Content-Type': 'application/json' }),
+              body: JSON.stringify(commentBody),
+            }
+          );
+          sendJson(res, 200, { ok: true, commentId: result.id });
+        } catch (e) {
+          console.error('[Design Guardian] add-comment error:', e.message);
+          sendJson(res, 500, { error: e.message || 'Failed to post comment' });
+        }
+      });
+      return;
+    }
+
+    // ── DELETE /remove-comment ───────────────────────────────────────────────
+    // Deletes a Figma comment previously posted by /add-comment.
+    // Body: { fileKey, commentId }
+    if (req.method === 'DELETE' && url.pathname === '/remove-comment') {
+      if (!hasFigmaAuth(req)) {
+        sendJson(res, 500, { error: 'No Figma authentication available. Sign in via OAuth or configure FIGMA_PAT.' });
+        return;
+      }
+      const chunks = [];
+      req.on('data', function(chunk) { chunks.push(chunk); });
+      req.on('end', async function() {
+        const figmaHeaders = await getFigmaAuthHeaders(req);
+        const body = Buffer.concat(chunks).toString('utf8');
+        try {
+          const { fileKey, commentId } = JSON.parse(body);
+          if (!fileKey)   { sendJson(res, 400, { error: 'fileKey is required' }); return; }
+          if (!commentId) { sendJson(res, 400, { error: 'commentId is required' }); return; }
+
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 30000);
+          const response = await fetch(
+            `https://api.figma.com/v1/files/${fileKey}/comments/${commentId}`,
+            { method: 'DELETE', headers: figmaHeaders, signal: controller.signal }
+          );
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            const text = await response.text();
+            let detail = `HTTP ${response.status}`;
+            try { const j = JSON.parse(text); detail = j.err || j.message || j.error || detail; } catch (_) {}
+            throw new Error(`Figma API ${response.status}: ${detail}`);
+          }
+
+          sendJson(res, 200, { ok: true });
+        } catch (e) {
+          console.error('[Design Guardian] remove-comment error:', e.message);
+          sendJson(res, 500, { error: e.message || 'Failed to delete comment' });
         }
       });
       return;
@@ -1892,8 +2095,9 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     .map(function(n) { return '- [' + n.path + '] ' + JSON.stringify(n.characters); })
     .join('\n');
 
+  const persona = (cfg.persona || '').trim() || DEFAULT_AI_PERSONA;
   const prompt = [
-    'You are a design content reviewer. Check the following text content from a design file against the provided guidelines.',
+    persona,
     '',
     '## Content Guidelines',
     guidelines,
@@ -1904,8 +2108,17 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     'Return ONLY a JSON array of issues. Each issue must have:',
     '- "layerPath": the layer path from the list above',
     '- "characters": the exact text that has the issue',
-    '- "issue": a short description of what violates the guideline',
-    '- "suggestion": a concrete suggested fix',
+    '- "issue": ONE sentence, max 12 words. State only the violation. No conjunctions, no "also", no extra context.',
+    '- "suggestion": ONE sentence, max 12 words. Give the fix or an example replacement.',
+    '- "rule": 2-4 words naming the specific guideline violated. Examples: "Sentence case", "Banned term", "CTA specificity", "Second person", "Oxford comma".',
+    '- "severity": "error" (clear rule violation) | "warning" (judgment call) | "suggestion" (optional improvement).',
+    '- "replacement": the exact corrected text string only — just the fixed version of "characters", nothing else. Omit this field entirely if no clean single replacement exists.',
+    '',
+    'Bad example: "All-caps violates sentence case. \'Action\' is flagged in the glossary and the accessibility guideline warns against generic copy."',
+    'Good example issue: "All-caps violates sentence case requirement."',
+    'Good example suggestion: "Use sentence case: \'Get started\' or \'Add exclusion\'."',
+    'Good example rule: "Sentence case"',
+    'Good example replacement: "Get started"',
     '',
     'If there are no issues, return an empty array []. Return only valid JSON, no explanation.',
   ].join('\n');
@@ -1929,7 +2142,11 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
 function parseAiJsonResponse(text) {
   const match = text.match(/\[[\s\S]*\]/);
   if (!match) return [];
-  try { return JSON.parse(match[0]); } catch (_) { return []; }
+  try {
+    return JSON.parse(match[0]);
+  } catch (e) {
+    return [];
+  }
 }
 
 // runAiScanAnthropic: calls Anthropic Messages API with the given prompt; returns parsed issues array.
@@ -2007,7 +2224,9 @@ function spawnCli(cmd, args, stdinData) {
     });
     child.on('close', function(code) {
       if (!stdout.trim() && code !== 0) {
-        reject(new Error(cmd + ' exited with code ' + code + '. Make sure you are logged in.'));
+        var detail = stderr.trim() || ('exit code ' + code);
+        console.error('[spawnCli] ' + cmd + ' failed — stderr: ' + stderr.trim());
+        reject(new Error(cmd + ' CLI error: ' + detail));
       } else {
         resolve(stdout);
       }
@@ -2030,32 +2249,14 @@ function isCliInstalled(cmd) {
 async function checkCliAuth(provider) {
   try {
     if (provider === 'anthropic') {
-      // claude auth status reads from disk and can report "logged in" even when the session is expired.
-      // Do a real test call to confirm the CLI actually works; kill on first stdout line or 12s timeout.
+      // `claude auth status` is instant (reads local session, no API call) and returns
+      // structured JSON: { loggedIn: true/false, authMethod, email, ... }
       return await new Promise(function(resolve) {
-        var child = spawn('claude', ['-p', '--no-session-persistence'], { env: process.env });
-        var stdout = '';
-        var stderr = '';
-        var done = false;
-        function finish(result) {
-          if (done) return;
-          done = true;
-          try { child.kill(); } catch (_) {}
-          resolve(result);
-        }
-        child.stdout.on('data', function(d) {
-          stdout += d.toString();
-          var out = stdout.toLowerCase();
-          if (out.includes('not logged in') || out.includes('please run')) finish(false);
-          else if (stdout.trim().length > 0) finish(true);
+        execFile('claude', ['auth', 'status'], { timeout: 8000, env: process.env }, function(err, stdout) {
+          if (err) { resolve(false); return; }
+          try { resolve(!!JSON.parse(stdout.trim()).loggedIn); }
+          catch (_) { resolve(false); }
         });
-        child.stderr.on('data', function(d) { stderr += d.toString(); });
-        child.on('error', function() { finish(false); });
-        child.on('close', function(code) {
-          if (!done) finish(code === 0 && !stdout.toLowerCase().includes('not logged in'));
-        });
-        setTimeout(function() { finish(false); }, 12000);
-        try { child.stdin.write('1'); child.stdin.end(); } catch (_) { finish(false); }
       });
     }
     if (provider === 'google') {
@@ -2088,14 +2289,28 @@ async function checkCliAuth(provider) {
 // Prompt is passed via stdin; model is passed via --model flag where supported.
 async function runAiScanCLI(provider, model, prompt) {
   var cliConfigs = {
-    anthropic: { cmd: 'claude', args: ['-p', '--bare', '--no-session-persistence'] },
+    // --bare and --no-session-persistence removed: --bare is not supported by all Claude Code
+    // versions and causes "not logged in" rejections on enterprise installs. --no-session-persistence
+    // strips enterprise SSO credentials. -p (print mode) alone is sufficient.
+    anthropic: { cmd: 'claude', args: ['-p'] },
     google:    { cmd: 'gemini', args: ['-p'] },
     openai:    { cmd: 'codex',  args: ['exec', '-', '--ephemeral'] },
   };
   var cli = cliConfigs[provider];
   if (!cli) throw new Error('CLI subscription is not supported for provider: ' + provider + '. Use API Key mode instead.');
-  var args = model ? cli.args.concat(['--model', model]) : cli.args;
+  // Do not pass --model for CLI subscription — the CLI/enterprise account has its own
+  // configured model. Forcing a specific model ID causes failures in managed environments.
+  var args = cli.args.slice();
   var stdout = await spawnCli(cli.cmd, args, prompt);
+  // Only treat as an auth error if the response literally says "not logged in".
+  // Avoid matching "login" broadly — AI responses about login flows would trigger false positives.
+  if (!stdout.includes('[') && (
+    stdout.toLowerCase().includes('not logged in') ||
+    stdout.toLowerCase().includes('please run /login') ||
+    stdout.toLowerCase().includes('unauthorized')
+  )) {
+    throw new Error('CLI not authenticated: ' + stdout.trim() + '. Run `' + cli.cmd + '` in your terminal and use /login.');
+  }
   return parseAiJsonResponse(stdout);
 }
 
@@ -2149,12 +2364,41 @@ function tryGenerateCertsWithMkcert() {
   return !gen.error && gen.status === 0;
 }
 
+// isCertTrusted: verifies the existing cert is signed by the mkcert root CA that is
+// currently installed on this machine. Returns true if trusted, false if the CA is
+// missing or the cert can't be verified (e.g. mkcert was installed AFTER the cert was
+// generated, so -install was never run and the root CA was never added to the trust store).
+function isCertTrusted(cert) {
+  var carootResult = spawnSync('mkcert', ['-CAROOT'], { stdio: 'pipe' });
+  if (carootResult.error || carootResult.status !== 0) return true; // mkcert gone — assume ok, handle below
+  var caroot = carootResult.stdout.toString().trim();
+  var caFile = path.join(caroot, 'rootCA.pem');
+  if (!fs.existsSync(caFile)) return false;
+  // openssl verify returns exit 0 only when the chain is fully trusted
+  var verify = spawnSync('openssl', ['verify', '-CAfile', caFile, cert], { stdio: 'pipe' });
+  if (verify.error) return true; // openssl not available — skip check
+  return verify.status === 0;
+}
+
 let hasTls = fs.existsSync(certPath) && fs.existsSync(keyPath);
 if (!hasTls) {
   if (tryGenerateCertsWithMkcert()) {
     hasTls = fs.existsSync(certPath) && fs.existsSync(keyPath);
     if (hasTls) console.log('[Design Guardian] Generated TLS certificate via mkcert');
   } else {
+    console.log('[Design Guardian] mkcert not found - run: brew install mkcert (then restart for HTTPS)');
+  }
+} else if (!isCertTrusted(certPath)) {
+  // Cert files exist but are not trusted — most common cause: mkcert was installed after
+  // the cert was first generated, so mkcert -install never ran and the root CA was never
+  // added to the system trust store. Delete stale certs and regenerate with a fresh install.
+  console.log('[Design Guardian] Existing TLS certificate is not trusted by this machine. Re-generating...');
+  try { fs.unlinkSync(certPath); fs.unlinkSync(keyPath); } catch (e) {}
+  if (tryGenerateCertsWithMkcert()) {
+    hasTls = fs.existsSync(certPath) && fs.existsSync(keyPath);
+    if (hasTls) console.log('[Design Guardian] Re-generated trusted TLS certificate via mkcert');
+  } else {
+    hasTls = false;
     console.log('[Design Guardian] mkcert not found - run: brew install mkcert (then restart for HTTPS)');
   }
 }
