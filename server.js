@@ -391,8 +391,9 @@ function sendJson(res, status, data) {
   res.end(jsonString);
 }
 
-// fetchJson: makes an authenticated Figma API request; throws on non-2xx or JSON parse failure.
-async function fetchJson(url, options = {}) {
+// fetchJson: makes an HTTP request and parses JSON; throws on non-2xx or JSON parse failure.
+// label is used in error messages — pass a provider name for non-Figma calls (e.g. 'Anthropic API').
+async function fetchJson(url, options = {}, label = 'Figma API') {
 
   // Timeout covers both headers AND body download. Cleared only after response.text()
   // completes -- clearing at header arrival left large body reads with no timeout.
@@ -408,19 +409,19 @@ async function fetchJson(url, options = {}) {
     try {
       json = JSON.parse(text);
     } catch (e) {
-      throw new Error(`Invalid JSON from Figma: ${text}`);
+      throw new Error(`Invalid JSON from ${label}: ${text}`);
     }
 
     if (!response.ok) {
       const detail = json?.err || json?.message || json?.error || JSON.stringify(json);
-      throw new Error(`Figma API ${response.status}: ${detail}`);
+      throw new Error(`${label} ${response.status}: ${detail}`);
     }
 
     return json;
   } catch (error) {
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-      throw new Error('Figma API timeout (240s)');
+      throw new Error(`${label} timeout (240s)`);
     }
     throw error;
   }
@@ -1962,6 +1963,76 @@ async function requestHandler(req, res) {
       return;
     }
 
+    // ── POST /ai/test-connection ─────────────────────────────────────────────
+    // Tests the configured AI provider by sending a minimal 1-token prompt.
+    // Body: { provider, apiKey, model, authMethod }
+    // Returns: { ok: true } or { ok: false, error: string }
+    if (req.method === 'POST' && url.pathname === '/ai/test-connection') {
+      const chunks = [];
+      req.on('data', function(chunk) { chunks.push(chunk); });
+      req.on('end', async function() {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          const { provider, apiKey, model, authMethod } = body;
+          if (authMethod === 'cli') {
+            const cliCmd = provider === 'anthropic' ? 'claude' : provider === 'google' ? 'gemini' : 'codex';
+            const installed = await isCliInstalled(cliCmd);
+            if (!installed) { sendJson(res, 200, { ok: false, error: cliCmd + ' CLI not found on PATH' }); return; }
+            const authed = await checkCliAuth(provider);
+            if (!authed) { sendJson(res, 200, { ok: false, error: 'CLI is not logged in. Run the login command first.' }); return; }
+            sendJson(res, 200, { ok: true });
+            return;
+          }
+          if (!apiKey) { sendJson(res, 200, { ok: false, error: 'API key is required' }); return; }
+          if (!model)  { sendJson(res, 200, { ok: false, error: 'Model is required' }); return; }
+          const testPrompt = 'Reply with the single word: ok';
+          if (provider === 'anthropic') {
+            await fetchJson('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+              body: JSON.stringify({ model, max_tokens: 5, messages: [{ role: 'user', content: testPrompt }] }),
+            }, 'Anthropic API');
+          } else if (provider === 'openai') {
+            await fetchJson('https://api.openai.com/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+              body: JSON.stringify({ model, max_tokens: 5, messages: [{ role: 'user', content: testPrompt }] }),
+            }, 'OpenAI API');
+          } else if (provider === 'google') {
+            const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey;
+            await fetchJson(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ contents: [{ parts: [{ text: testPrompt }] }] }),
+            }, 'Google AI API');
+          } else {
+            sendJson(res, 200, { ok: false, error: 'Unknown provider: ' + provider }); return;
+          }
+          sendJson(res, 200, { ok: true });
+        } catch (e) {
+          sendJson(res, 200, { ok: false, error: e.message || 'Connection failed' });
+        }
+      });
+      return;
+    }
+
+    // ── GET /ai/test-endpoint ────────────────────────────────────────────────
+    // Tests an Ollama endpoint by calling /api/tags and checking for a model list.
+    // Query param: url (the Ollama base URL)
+    // Returns: { ok: true, models: [...] } or { ok: false, error: string }
+    if (req.method === 'GET' && url.pathname === '/ai/test-endpoint') {
+      const ollamaUrl = (url.searchParams.get('url') || '').replace(/\/$/, '');
+      if (!ollamaUrl) { sendJson(res, 200, { ok: false, error: 'url parameter is required' }); return; }
+      try {
+        const result = await fetchJson(ollamaUrl + '/api/tags', {}, 'Ollama');
+        const models = (result && Array.isArray(result.models) ? result.models : []).map(function(m) { return m.name || m; });
+        sendJson(res, 200, { ok: true, models });
+      } catch (e) {
+        sendJson(res, 200, { ok: false, error: e.message || 'Could not reach Ollama endpoint' });
+      }
+      return;
+    }
+
     // ── POST /ai/scan ────────────────────────────────────────────────────────
     // Accepts text nodes from a frame, checks against guidelines via configured AI provider.
     // No auth — self-hosted server is user-owned (consistent with /ai/config, /ai/guidelines).
@@ -2246,7 +2317,7 @@ async function runAiScanAnthropic(apiKey, model, prompt) {
       max_tokens: 2048,
       messages: [{ role: 'user', content: prompt }],
     }),
-  });
+  }, 'Anthropic API');
   const text = res && res.content && res.content[0] && res.content[0].text || '';
   return parseAiJsonResponse(text);
 }
@@ -2261,7 +2332,7 @@ async function runAiScanOpenAI(apiKey, model, prompt) {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 2048,
     }),
-  });
+  }, 'OpenAI API');
   const text = res && res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content || '';
   return parseAiJsonResponse(text);
 }
@@ -2273,7 +2344,7 @@ async function runAiScanGoogle(apiKey, model, prompt) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-  });
+  }, 'Google AI API');
   const text = res && res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts && res.candidates[0].content.parts[0] && res.candidates[0].content.parts[0].text || '';
   return parseAiJsonResponse(text);
 }
@@ -2288,7 +2359,7 @@ async function runAiScanOllama(endpoint, model, prompt) {
       messages: [{ role: 'user', content: prompt }],
       stream: false,
     }),
-  });
+  }, 'Ollama');
   const text = res && res.message && res.message.content || '';
   return parseAiJsonResponse(text);
 }
@@ -2300,12 +2371,25 @@ function spawnCli(cmd, args, stdinData) {
     var child = spawn(cmd, args, { env: process.env });
     var stdout = '';
     var stderr = '';
+    var settled = false;
+    var timeoutId = setTimeout(function() {
+      if (settled) return;
+      settled = true;
+      try { child.kill(); } catch (_) {}
+      reject(new Error(cmd + ' CLI timed out after 60s'));
+    }, 60000);
     child.stdout.on('data', function(d) { stdout += d.toString(); });
     child.stderr.on('data', function(d) { stderr += d.toString(); });
     child.on('error', function() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
       reject(new Error(cmd + ' CLI not found. Install it and log in.'));
     });
     child.on('close', function(code) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
       if (!stdout.trim() && code !== 0) {
         var detail = stderr.trim() || ('exit code ' + code);
         console.error('[spawnCli] ' + cmd + ' failed — stderr: ' + stderr.trim());
