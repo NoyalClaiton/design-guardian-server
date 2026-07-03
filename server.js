@@ -60,6 +60,14 @@ const JWT_SECRET = process.env.JWT_SECRET || '';
 const TOKEN_ENC_KEY = process.env.TOKEN_ENCRYPTION_KEY ? Buffer.from(process.env.TOKEN_ENCRYPTION_KEY, 'hex') : null;
 // Pending auth states expire after 10 minutes
 const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
+const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB hard cap on all POST bodies that accept file content
+
+// escHtml: escapes HTML special chars for safe interpolation into HTML page responses.
+function escHtml(s) {
+  return String(s).replace(/[&<>"]/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+}
 
 // ── User store (fs + in-memory Maps, no native dependencies) ─────────────────
 // users: persisted to a JSON file. Two Maps for O(1) lookup by id or figmaUserId.
@@ -103,11 +111,19 @@ const AI_DEFAULT_MODELS = {
 };
 
 // loadAiConfig: reads AI provider config from disk; returns safe defaults if file is missing.
+// Auto-generates a pairingToken if one is not already stored (used for CSRF protection on POST /ai/* endpoints).
 function loadAiConfig() {
   try {
-    return JSON.parse(fs.readFileSync(AI_CONFIG_FILE, 'utf8'));
+    const cfg = JSON.parse(fs.readFileSync(AI_CONFIG_FILE, 'utf8'));
+    if (!cfg.pairingToken) {
+      cfg.pairingToken = crypto.randomBytes(16).toString('hex');
+      saveAiConfig(cfg);
+    }
+    return cfg;
   } catch (_) {
-    return { provider: '', model: '', apiKey: '', ollamaEndpoint: 'http://localhost:11434' };
+    const cfg = { provider: '', model: '', apiKey: '', ollamaEndpoint: 'http://localhost:11434', pairingToken: crypto.randomBytes(16).toString('hex') };
+    saveAiConfig(cfg);
+    return cfg;
   }
 }
 
@@ -115,6 +131,17 @@ function loadAiConfig() {
 function saveAiConfig(cfg) {
   fs.mkdirSync(path.dirname(AI_CONFIG_FILE), { recursive: true });
   fs.writeFileSync(AI_CONFIG_FILE, JSON.stringify(cfg, null, 2));
+}
+
+// aiTokenGuard: validates the X-DG-Token header against the stored pairing token.
+// Returns true if the request is authorized; returns false and sends a 401 if not.
+function aiTokenGuard(req, res) {
+  const cfg = loadAiConfig();
+  if (cfg.pairingToken && req.headers['x-dg-token'] !== cfg.pairingToken) {
+    sendJson(res, 401, { error: 'Invalid or missing plugin token. Reconnect to the server to refresh.' });
+    return false;
+  }
+  return true;
 }
 
 let _nextUserId = 1;
@@ -385,7 +412,7 @@ function sendJson(res, status, data) {
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type,X-DG-Token',
     'Access-Control-Allow-Private-Network': 'true'
   });
   res.end(jsonString);
@@ -1226,7 +1253,7 @@ async function requestHandler(req, res) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-DG-Token',
       'Access-Control-Allow-Private-Network': 'true'
     });
     res.end();
@@ -1486,7 +1513,7 @@ async function requestHandler(req, res) {
       } catch (err) {
         console.error('[Backend Error] getLibraryData failed:', err.message);
         console.error('[Backend Error] Stack:', err.stack);
-        sendJson(res, 500, { error: err.message, details: err.stack });
+        sendJson(res, 500, { error: 'Library data unavailable. Try again or check your Figma connection.' });
       }
       return;
     }
@@ -1708,7 +1735,7 @@ async function requestHandler(req, res) {
       if (oauthError) {
         console.error('[OAuth callback] Figma returned error:', oauthError, oauthErrorDesc);
         res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end('<p>Authorization failed: ' + oauthError + (oauthErrorDesc ? ' - ' + oauthErrorDesc : '') + '. You can close this tab.</p>');
+        res.end('<p>Authorization failed: ' + escHtml(oauthError) + (oauthErrorDesc ? ' - ' + escHtml(oauthErrorDesc) : '') + '. You can close this tab.</p>');
         return;
       }
       if (!code || !state) {
@@ -1752,12 +1779,12 @@ async function requestHandler(req, res) {
       } catch (err) {
         console.error('[OAuth callback error]', err.message, err.stack);
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Design Guardian</title>
-          <style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0d0d0d;color:#e5e5e5;}
-          .card{text-align:center;padding:40px;border-radius:12px;background:#1a1a1a;border:1px solid #2a2a2a;}
-          h2{margin:0 0 8px;font-size:18px;}p{margin:0;color:#888;font-size:14px;}</style>
-          </head><body><div class="card"><h2>Connection failed</h2>
-          <p>${err.message}</p></div></body></html>`);
+        res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Design Guardian</title>' +
+          '<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0d0d0d;color:#e5e5e5;}' +
+          '.card{text-align:center;padding:40px;border-radius:12px;background:#1a1a1a;border:1px solid #2a2a2a;}' +
+          'h2{margin:0 0 8px;font-size:18px;}p{margin:0;color:#888;font-size:14px;}</style>' +
+          '</head><body><div class="card"><h2>Connection failed</h2>' +
+          '<p>' + escHtml(err.message) + '</p></div></body></html>');
       }
       return;
     }
@@ -1815,13 +1842,15 @@ async function requestHandler(req, res) {
         defaultModels: AI_DEFAULT_MODELS,
         persona: cfg.persona || '',
         defaultPersona: DEFAULT_AI_PERSONA,
+        pairingToken: cfg.pairingToken || '',
       });
       return;
     }
 
     // ── POST /ai/config ──────────────────────────────────────────────────────
-    // Saves AI provider config. No auth — self-hosted server is user-owned.
+    // Saves AI provider config. Protected by pairing token (X-DG-Token header).
     if (req.method === 'POST' && url.pathname === '/ai/config') {
+      if (!aiTokenGuard(req, res)) return;
       const chunks = [];
       req.on('data', function(chunk) { chunks.push(chunk); });
       req.on('end', function() {
@@ -1940,16 +1969,19 @@ async function requestHandler(req, res) {
     // Accepts { files: [{name,content,lines,enabled}], manual: string }.
     // Merges into a single content string for AI scans and stores all three.
     if (req.method === 'POST' && url.pathname === '/ai/guidelines') {
+      if (!aiTokenGuard(req, res)) return;
       const chunks = [];
-      req.on('data', function(chunk) { chunks.push(chunk); });
+      let glBodySize = 0, glBodyTooBig = false;
+      req.on('data', function(chunk) { glBodySize += chunk.length; if (glBodySize > MAX_BODY_BYTES) { glBodyTooBig = true; return; } chunks.push(chunk); });
       req.on('end', function() {
+        if (glBodyTooBig) { sendJson(res, 413, { error: 'Guidelines payload exceeds 5 MB limit' }); return; }
         const body = Buffer.concat(chunks).toString('utf8');
         try {
           const payload = JSON.parse(body);
           const files = Array.isArray(payload.files) ? payload.files : [];
           const manual = typeof payload.manual === 'string' ? payload.manual.trim() : '';
           const fileContent = files.filter(function(f) { return f.enabled !== false; })
-            .map(function(f) { return '--- ' + f.name + ' ---\n' + (f.content || ''); }).join('\n\n');
+            .map(function(f) { return '--- ' + f.name + ' ---\n' + stripYamlFrontmatter(f.content || ''); }).join('\n\n');
           const content = fileContent && manual ? fileContent + '\n\n--- Manual ---\n' + manual
             : fileContent || manual;
           fs.mkdirSync(path.dirname(GUIDELINES_FILE), { recursive: true });
@@ -1958,6 +1990,39 @@ async function requestHandler(req, res) {
         } catch (e) {
           console.error('[Design Guardian] POST /ai/guidelines error:', e.message);
           sendJson(res, 500, { error: e.message || 'Failed to save guidelines' });
+        }
+      });
+      return;
+    }
+
+    // ── POST /ai/evaluate-guidelines ─────────────────────────────────────────
+    // Evaluates uploaded guidelines for quality before they are used in scans.
+    // Body: { content: string }
+    // Returns: { ok: true, issues: [{ severity, category, message, suggestion }] }
+    if (req.method === 'POST' && url.pathname === '/ai/evaluate-guidelines') {
+      if (!aiTokenGuard(req, res)) return;
+      const evalChunks = [];
+      let evalBodySize = 0, evalBodyTooBig = false;
+      req.on('data', function(chunk) { evalBodySize += chunk.length; if (evalBodySize > MAX_BODY_BYTES) { evalBodyTooBig = true; return; } evalChunks.push(chunk); });
+      req.on('end', async function() {
+        if (evalBodyTooBig) { sendJson(res, 413, { error: 'Content exceeds 5 MB limit' }); return; }
+        const body = Buffer.concat(evalChunks).toString('utf8');
+        try {
+          const { content } = JSON.parse(body);
+          if (!content || !content.trim()) {
+            sendJson(res, 400, { error: 'content is required' });
+            return;
+          }
+          const cfg = loadAiConfig();
+          if (!cfg.provider) {
+            sendJson(res, 400, { error: 'AI provider not configured. Set it in plugin settings.' });
+            return;
+          }
+          const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
+          const issues = await runAiGuidelinesEvaluation(cfg, model, content);
+          sendJson(res, 200, { ok: true, issues });
+        } catch (e) {
+          sendJson(res, 500, { error: e.message || 'Guidelines evaluation failed' });
         }
       });
       return;
@@ -2035,9 +2100,10 @@ async function requestHandler(req, res) {
 
     // ── POST /ai/scan ────────────────────────────────────────────────────────
     // Accepts text nodes from a frame, checks against guidelines via configured AI provider.
-    // No auth — self-hosted server is user-owned (consistent with /ai/config, /ai/guidelines).
+    // Protected by pairing token (X-DG-Token header).
     // Body: { textNodes: [{ id, name, characters, path }] }
     if (req.method === 'POST' && url.pathname === '/ai/scan') {
+      if (!aiTokenGuard(req, res)) return;
       const chunks = [];
       req.on('data', function(chunk) { chunks.push(chunk); });
       req.on('end', async function() {
@@ -2082,6 +2148,7 @@ async function requestHandler(req, res) {
     // frame scans. Accepts raw AI issues and returns a consistent set.
     // Body: { issues: [...rawAiIssues] }
     if (req.method === 'POST' && url.pathname === '/ai/normalize') {
+      if (!aiTokenGuard(req, res)) return;
       const normChunks = [];
       req.on('data', function(chunk) { normChunks.push(chunk); });
       req.on('end', async function() {
@@ -2186,6 +2253,14 @@ async function requestHandler(req, res) {
   }
 }
 
+// stripYamlFrontmatter: removes --- ... --- block from the start of a SKILL.md file so only the body is used as guidelines.
+function stripYamlFrontmatter(text) {
+  if (!text || !text.startsWith('---')) return text;
+  var end = text.indexOf('\n---', 3);
+  if (end === -1) return text;
+  return text.slice(end + 4).replace(/^\n/, '');
+}
+
 // ── AI provider router ────────────────────────────────────────────────────────
 // Sends text content + guidelines to the configured AI provider.
 // Returns array of { layerName, path, issue, suggestion } objects.
@@ -2195,23 +2270,28 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     .join('\n');
 
   const persona = (cfg.persona || '').trim() || DEFAULT_AI_PERSONA;
-  const prompt = [
+
+  // systemPart: persona + guidelines (cacheable; identical across all parallel frame scans)
+  const systemPart = [
     persona,
     '',
     '## Content Guidelines',
     guidelines,
-    '',
+  ].join('\n');
+
+  // userPart: per-frame content + output instructions (changes each call)
+  const userPart = [
     '## Text Content from Design (format: [layer path] "text")',
     textSummary,
     '',
     'Return ONLY a JSON array of issues. Each issue must have:',
     '- "layerPath": the layer path from the list above',
-    '- "characters": the exact text that has the issue',
+    '- "characters": copy the full text string for that layer exactly as it appears in the input above, character for character',
     '- "issue": ONE sentence, max 24 words. State only the violation. No conjunctions, no "also", no extra context.',
     '- "suggestion": ONE sentence, max 24 words. Give the fix or an example replacement.',
     '- "rule": 2-4 words naming the specific guideline violated. Examples: "Sentence case", "Banned term", "CTA specificity", "Second person", "Oxford comma".',
     '- "severity": "error" (clear rule violation) | "warning" (judgment call) | "suggestion" (optional improvement).',
-    '- "replacement": the exact corrected text string only — just the fixed version of "characters", nothing else. Omit this field entirely if no clean single replacement exists.',
+    '- "replacement": the exact corrected text string only -- just the fixed version of "characters", nothing else. Omit this field entirely if no clean single replacement exists.',
     '',
     'Bad example: "All-caps violates sentence case. \'Action\' is flagged in the glossary and the accessibility guideline warns against generic copy."',
     'Good example issue: "All-caps violates sentence case requirement."',
@@ -2222,17 +2302,21 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     'If there are no issues, return an empty array []. Return only valid JSON, no explanation.',
   ].join('\n');
 
+  // fullPrompt: functionally equivalent to the original joined array; used for non-Anthropic providers
+  const fullPrompt = systemPart + '\n\n' + userPart;
+
   if (cfg.authMethod === 'cli') {
-    return await runAiScanCLI(cfg.provider, model, prompt);
+    return await runAiScanCLI(cfg.provider, model, fullPrompt, 'content-scan');
   }
   if (cfg.provider === 'anthropic') {
-    return await runAiScanAnthropic(cfg.apiKey, model, prompt);
+    // Pass systemPart separately so Anthropic can cache the guidelines across parallel frame scans
+    return await runAiScanAnthropic(cfg.apiKey, model, userPart, systemPart, 'content-scan');
   } else if (cfg.provider === 'openai') {
-    return await runAiScanOpenAI(cfg.apiKey, model, prompt);
+    return await runAiScanOpenAI(cfg.apiKey, model, fullPrompt, 'content-scan');
   } else if (cfg.provider === 'google') {
-    return await runAiScanGoogle(cfg.apiKey, model, prompt);
+    return await runAiScanGoogle(cfg.apiKey, model, fullPrompt, 'content-scan');
   } else if (cfg.provider === 'ollama') {
-    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt);
+    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, fullPrompt, 'content-scan');
   }
   throw new Error('Unknown AI provider: ' + cfg.provider);
 }
@@ -2263,15 +2347,15 @@ async function runAiNormalizationPass(cfg, model, issues) {
 
   let rawResult;
   if (cfg.authMethod === 'cli') {
-    rawResult = await runAiScanCLI(cfg.provider, model, prompt);
+    rawResult = await runAiScanCLI(cfg.provider, model, prompt, 'normalize');
   } else if (cfg.provider === 'anthropic') {
-    rawResult = await runAiScanAnthropic(cfg.apiKey, model, prompt);
+    rawResult = await runAiScanAnthropic(cfg.apiKey, model, prompt, null, 'normalize');
   } else if (cfg.provider === 'openai') {
-    rawResult = await runAiScanOpenAI(cfg.apiKey, model, prompt);
+    rawResult = await runAiScanOpenAI(cfg.apiKey, model, prompt, 'normalize');
   } else if (cfg.provider === 'google') {
-    rawResult = await runAiScanGoogle(cfg.apiKey, model, prompt);
+    rawResult = await runAiScanGoogle(cfg.apiKey, model, prompt, 'normalize');
   } else if (cfg.provider === 'ollama') {
-    rawResult = await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt);
+    rawResult = await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt, 'normalize');
   } else {
     return issues;
   }
@@ -2292,6 +2376,50 @@ async function runAiNormalizationPass(cfg, model, issues) {
   });
 }
 
+// runAiGuidelinesEvaluation: sends guidelines content to the AI with a meta-prompt and returns quality issues.
+// Returns array of { severity, category, message, suggestion } objects.
+async function runAiGuidelinesEvaluation(cfg, model, content) {
+  const prompt = [
+    'You are a content design expert evaluating a guidelines document that will be used by an AI to review UI copy in Figma designs.',
+    '',
+    '## Guidelines content',
+    content,
+    '',
+    '## Your task',
+    'Evaluate this document for quality issues that would make AI enforcement unreliable. Return a JSON array of issues.',
+    'Each issue must have:',
+    '- "severity": "error" (AI cannot apply this rule reliably) | "warning" (may produce inconsistent results) | "suggestion" (optional improvement)',
+    '- "category": 2-4 word label. Examples: "Vague rule", "Missing example", "Contradiction", "Reference not instruction", "Missing category".',
+    '- "message": ONE sentence, max 24 words. State the specific problem clearly.',
+    '- "suggestion": ONE sentence, max 24 words. Give actionable advice to fix it.',
+    '',
+    'Check for:',
+    '0. Wrong file type — if the content is not UI copy guidelines at all (e.g. a workflow, code review skill, scheduling task, or technical spec), return a SINGLE error with category "Wrong file type" and message "This file does not appear to contain UI copy guidelines." Do not check anything else.',
+    '1. Rules too vague to enforce — e.g., "write clearly" with no measurable criteria',
+    '2. Rules without examples — especially for terminology, casing, or tone',
+    '3. Contradicting rules — one rule says X, another says the opposite',
+    '4. Reference-style content — documents what exists instead of instructing what to flag',
+    '5. Missing major UI copy categories that are typically needed: tone, sentence case, CTAs/buttons, error messages, placeholder text, banned terms',
+    '',
+    'Only flag real issues. If a rule is clear and enforceable, do not flag it.',
+    'If the guidelines are high quality, return only 0-2 minor suggestions or an empty array.',
+    'Return ONLY a JSON array. Return [] if no issues. No explanation.',
+  ].join('\n');
+
+  if (cfg.authMethod === 'cli') {
+    return await runAiScanCLI(cfg.provider, model, prompt, 'eval-guidelines');
+  } else if (cfg.provider === 'anthropic') {
+    return await runAiScanAnthropic(cfg.apiKey, model, prompt, null, 'eval-guidelines');
+  } else if (cfg.provider === 'openai') {
+    return await runAiScanOpenAI(cfg.apiKey, model, prompt, 'eval-guidelines');
+  } else if (cfg.provider === 'google') {
+    return await runAiScanGoogle(cfg.apiKey, model, prompt, 'eval-guidelines');
+  } else if (cfg.provider === 'ollama') {
+    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt, 'eval-guidelines');
+  }
+  throw new Error('Unknown AI provider: ' + cfg.provider);
+}
+
 // parseAiJsonResponse: extracts a JSON array from an AI response string; returns [] on parse failure.
 function parseAiJsonResponse(text) {
   const match = text.match(/\[[\s\S]*\]/);
@@ -2304,53 +2432,82 @@ function parseAiJsonResponse(text) {
 }
 
 // runAiScanAnthropic: calls Anthropic Messages API with the given prompt; returns parsed issues array.
-async function runAiScanAnthropic(apiKey, model, prompt) {
+// If cacheableSystem is provided, it is sent as the system prompt with prompt caching enabled,
+// and prompt is sent as the user message. This reduces token costs on parallel frame scans.
+async function runAiScanAnthropic(apiKey, model, prompt, cacheableSystem, label) {
+  const reqHeaders = {
+    'Content-Type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01',
+  };
+  let bodyData;
+  if (cacheableSystem) {
+    reqHeaders['anthropic-beta'] = 'prompt-caching-2024-07-31';
+    bodyData = {
+      model: model,
+      max_tokens: 4096,
+      system: [{ type: 'text', text: cacheableSystem, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: prompt }],
+    };
+  } else {
+    bodyData = {
+      model: model,
+      max_tokens: 4096,
+      messages: [{ role: 'user', content: prompt }],
+    };
+  }
   const res = await fetchJson('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: model,
-      max_tokens: 2048,
-      messages: [{ role: 'user', content: prompt }],
-    }),
+    headers: reqHeaders,
+    body: JSON.stringify(bodyData),
   }, 'Anthropic API');
+  const usage = res && res.usage;
+  const cacheRead = (usage && usage.cache_read_input_tokens) || 0;
+  const cacheCreate = (usage && usage.cache_creation_input_tokens) || 0;
+  const cacheInfo = (cacheRead || cacheCreate) ? (' cache_read=' + cacheRead + ' cache_write=' + cacheCreate) : '';
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.input_tokens || '?') + ' out=' + (usage && usage.output_tokens || '?') + cacheInfo);
+  if (res && res.stop_reason === 'max_tokens') throw new Error('AI response truncated (output limit reached). Try scanning fewer nodes at once.');
   const text = res && res.content && res.content[0] && res.content[0].text || '';
   return parseAiJsonResponse(text);
 }
 
 // runAiScanOpenAI: calls OpenAI Chat Completions API; returns parsed issues array.
-async function runAiScanOpenAI(apiKey, model, prompt) {
+async function runAiScanOpenAI(apiKey, model, prompt, label) {
   const res = await fetchJson('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
     body: JSON.stringify({
       model: model,
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 2048,
+      max_tokens: 4096,
     }),
   }, 'OpenAI API');
+  const usage = res && res.usage;
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.prompt_tokens || '?') + ' out=' + (usage && usage.completion_tokens || '?'));
+  const finishReason = res && res.choices && res.choices[0] && res.choices[0].finish_reason;
+  if (finishReason === 'length') throw new Error('AI response truncated (output limit reached). Try scanning fewer nodes at once.');
   const text = res && res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content || '';
   return parseAiJsonResponse(text);
 }
 
 // runAiScanGoogle: calls Google Generative Language API (Gemini); returns parsed issues array.
-async function runAiScanGoogle(apiKey, model, prompt) {
+async function runAiScanGoogle(apiKey, model, prompt, label) {
   const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey;
   const res = await fetchJson(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 4096 } }),
   }, 'Google AI API');
+  const usage = res && res.usageMetadata;
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.promptTokenCount || '?') + ' out=' + (usage && usage.candidatesTokenCount || '?'));
+  const finishReason = res && res.candidates && res.candidates[0] && res.candidates[0].finishReason;
+  if (finishReason === 'MAX_TOKENS') throw new Error('AI response truncated (output limit reached). Try scanning fewer nodes at once.');
   const text = res && res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts && res.candidates[0].content.parts[0] && res.candidates[0].content.parts[0].text || '';
   return parseAiJsonResponse(text);
 }
 
 // runAiScanOllama: calls a local Ollama instance; returns parsed issues array.
-async function runAiScanOllama(endpoint, model, prompt) {
+async function runAiScanOllama(endpoint, model, prompt, label) {
   const res = await fetchJson(endpoint + '/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2358,8 +2515,10 @@ async function runAiScanOllama(endpoint, model, prompt) {
       model: model,
       messages: [{ role: 'user', content: prompt }],
       stream: false,
+      options: { num_predict: 4096 },
     }),
   }, 'Ollama');
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (res && res.prompt_eval_count || '?') + ' out=' + (res && res.eval_count || '?'));
   const text = res && res.message && res.message.content || '';
   return parseAiJsonResponse(text);
 }
@@ -2454,7 +2613,7 @@ async function checkCliAuth(provider) {
 
 // Routes a CLI subscription scan to the correct CLI binary for the provider.
 // Prompt is passed via stdin; model is passed via --model flag where supported.
-async function runAiScanCLI(provider, model, prompt) {
+async function runAiScanCLI(provider, model, prompt, label) {
   var cliConfigs = {
     // --bare and --no-session-persistence removed: --bare is not supported by all Claude Code
     // versions and causes "not logged in" rejections on enterprise installs. --no-session-persistence
@@ -2469,6 +2628,7 @@ async function runAiScanCLI(provider, model, prompt) {
   // configured model. Forcing a specific model ID causes failures in managed environments.
   var args = cli.args.slice();
   var stdout = await spawnCli(cli.cmd, args, prompt);
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' provider=' + provider + ' (CLI, no token count)');
   // Only treat as an auth error if the response literally says "not logged in".
   // Avoid matching "login" broadly — AI responses about login flows would trigger false positives.
   if (!stdout.includes('[') && (
