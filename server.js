@@ -2239,9 +2239,9 @@ async function requestHandler(req, res) {
           }
 
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
-          const { content: resolvedGuidelines, failedUrls } = await resolveGuidelinesUrls(guidelines);
+          const { content: resolvedGuidelines, failedUrls, fetchedUrls } = await resolveGuidelinesUrls(guidelines);
           const issues = await runAiContentScan(cfg, model, resolvedGuidelines, textNodes);
-          sendJson(res, 200, { ok: true, issues, urlWarnings: failedUrls.length > 0 ? failedUrls : undefined, meta: { provider: cfg.provider, model, nodeCount: textNodes.length } });
+          sendJson(res, 200, { ok: true, issues, urlWarnings: failedUrls.length > 0 ? failedUrls : undefined, fetchedUrls: fetchedUrls.length > 0 ? fetchedUrls : undefined, meta: { provider: cfg.provider, model, nodeCount: textNodes.length } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'AI scan failed' });
         }
@@ -2279,9 +2279,9 @@ async function requestHandler(req, res) {
             sendJson(res, 400, { error: 'No content guidelines found. Upload guidelines in plugin settings.' }); return;
           }
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
-          const { content: resolvedGuidelines, failedUrls } = await resolveGuidelinesUrls(guidelines);
+          const { content: resolvedGuidelines, failedUrls, fetchedUrls } = await resolveGuidelinesUrls(guidelines);
           const issues = await runAiContentScanBatch(cfg, model, resolvedGuidelines, frames);
-          sendJson(res, 200, { ok: true, issues, urlWarnings: failedUrls.length > 0 ? failedUrls : undefined, meta: { provider: cfg.provider, model, frameCount: frames.length } });
+          sendJson(res, 200, { ok: true, issues, urlWarnings: failedUrls.length > 0 ? failedUrls : undefined, fetchedUrls: fetchedUrls.length > 0 ? fetchedUrls : undefined, meta: { provider: cfg.provider, model, frameCount: frames.length } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'Batch scan failed' });
         }
@@ -2523,10 +2523,10 @@ async function fetchUrlViaCli(url) {
 
 // resolveGuidelinesUrls: replaces URLs found in guidelines with their fetched content,
 // so Claude sees the referenced material inline. Cached per URL for 1 hour.
-// Returns { content: string, failedUrls: string[] } so callers can surface fetch failures.
+// Returns { content, failedUrls, fetchedUrls } so callers can surface both successes and failures.
 async function resolveGuidelinesUrls(content) {
   const urls = extractUrls(content);
-  if (urls.length === 0) return { content, failedUrls: [] };
+  if (urls.length === 0) return { content, failedUrls: [], fetchedUrls: [] };
 
   const now = Date.now();
 
@@ -2548,15 +2548,17 @@ async function resolveGuidelinesUrls(content) {
 
   let result = content;
   const failedUrls = [];
+  const fetchedUrls = [];
   for (var i = 0; i < fetchResults.length; i++) {
     var r = fetchResults[i];
     if (r.failed) {
       failedUrls.push(r.url);
     } else {
+      fetchedUrls.push(r.url);
       result = result.replace(r.url, r.url + '\n[Content from ' + r.url + ']:\n---\n' + r.text + '\n---');
     }
   }
-  return { content: result, failedUrls };
+  return { content: result, failedUrls, fetchedUrls };
 }
 
 // ── AI provider router ────────────────────────────────────────────────────────
@@ -2592,7 +2594,8 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     '- "suggestion": ONE sentence, max 24 words. Give the fix or an example replacement.',
     '- "rule": 2-4 words naming the specific guideline violated. Examples: "Sentence case", "Banned term", "CTA specificity", "Second person", "Oxford comma".',
     '- "severity": "error" (clear rule violation) | "warning" (judgment call) | "suggestion" (optional improvement).',
-    '- "replacement": the exact corrected text string only -- just the fixed version of "characters", nothing else. Omit this field entirely if no clean single replacement exists.',
+    '- "source_file": the name from the "--- Name ---" section header where this guideline is defined (e.g. "Brand Voice Guide.md"). Omit if the rule comes from multiple files or the source is unclear.',
+    '- "replacement": the FULL corrected text for this layer — the entire "characters" value after applying the fix, not just the changed word. Example: if characters is "I Drafted a High Severity" and the fix is sentence case, replacement must be "I drafted a High Severity". Omit this field entirely if no clean single replacement exists.',
     '',
     'Bad example: "All-caps violates sentence case. \'Action\' is flagged in the glossary and the accessibility guideline warns against generic copy."',
     'Good example issue: "All-caps violates sentence case requirement."',
@@ -2655,7 +2658,8 @@ async function runAiContentScanBatch(cfg, model, guidelines, frames) {
     '- "suggestion": ONE sentence, max 24 words. Give the fix or an example replacement.',
     '- "rule": 2-4 words naming the specific guideline violated.',
     '- "severity": "error" | "warning" | "suggestion"',
-    '- "replacement": the exact corrected text only. Omit if no clean single replacement exists.',
+    '- "source_file": the name from the "--- Name ---" section header where this guideline is defined. Omit if the rule comes from multiple files or is unclear.',
+    '- "replacement": the FULL corrected text for this layer (the entire "characters" value after fixing, not just the changed word). Omit if no clean single replacement exists.',
     '',
     'If there are no issues, return []. Return only valid JSON, no explanation.',
   ].join('\n');
