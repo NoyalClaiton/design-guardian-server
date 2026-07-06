@@ -159,6 +159,17 @@ const _usersById = new Map();
   } catch (_) {}
 })();
 
+// In-memory cache for guidelines evaluation results keyed by SHA-256 content hash.
+// Avoids re-running the AI eval when the guidelines file has not changed.
+const _evalGuidelinesCache = {};
+// In-flight promises keyed by content hash — coalesces concurrent requests for
+// identical content so only one Claude call is made even if N arrive simultaneously.
+const _evalGuidelinesInFlight = {};
+// URL content cache: keyed by URL, value = { content, fetchedAt }. Only successful
+// fetches are cached; failures are retried on the next scan.
+const _urlContentCache = {};
+const _URL_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
 // saveUsers: persists the in-memory user store to USERS_FILE (full replace, not append).
 function saveUsers() {
   fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
@@ -1869,6 +1880,9 @@ async function requestHandler(req, res) {
               : (existing.apiKey || ''),
             // Empty string means "use default persona" — preserve that intent explicitly
             persona: typeof incoming.persona === 'string' ? incoming.persona : (existing.persona || ''),
+            // Must carry the existing pairingToken — omitting it causes loadAiConfig to
+            // generate a new one on the next read, invalidating in-flight plugin requests.
+            pairingToken: existing.pairingToken || '',
           };
           saveAiConfig(updated);
           sendJson(res, 200, { ok: true });
@@ -2013,13 +2027,32 @@ async function requestHandler(req, res) {
             sendJson(res, 400, { error: 'content is required' });
             return;
           }
+          const contentHash = require('crypto').createHash('sha256').update(content).digest('hex').slice(0, 16);
+          if (_evalGuidelinesCache[contentHash]) {
+            sendJson(res, 200, { ok: true, issues: _evalGuidelinesCache[contentHash], cached: true });
+            return;
+          }
+          // Coalesce concurrent requests for the same content — only one Claude call fires.
+          if (_evalGuidelinesInFlight[contentHash]) {
+            const issues = await _evalGuidelinesInFlight[contentHash];
+            sendJson(res, 200, { ok: true, issues, cached: true });
+            return;
+          }
           const cfg = loadAiConfig();
           if (!cfg.provider) {
             sendJson(res, 400, { error: 'AI provider not configured. Set it in plugin settings.' });
             return;
           }
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
-          const issues = await runAiGuidelinesEvaluation(cfg, model, content);
+          const evalPromise = runAiGuidelinesEvaluation(cfg, model, content);
+          _evalGuidelinesInFlight[contentHash] = evalPromise;
+          let issues;
+          try {
+            issues = await evalPromise;
+          } finally {
+            delete _evalGuidelinesInFlight[contentHash];
+          }
+          _evalGuidelinesCache[contentHash] = issues;
           sendJson(res, 200, { ok: true, issues });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'Guidelines evaluation failed' });
@@ -2134,10 +2167,51 @@ async function requestHandler(req, res) {
           }
 
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
-          const issues = await runAiContentScan(cfg, model, guidelines, textNodes);
+          const resolvedGuidelines = await resolveGuidelinesUrls(guidelines);
+          const issues = await runAiContentScan(cfg, model, resolvedGuidelines, textNodes);
           sendJson(res, 200, { ok: true, issues, meta: { provider: cfg.provider, model, nodeCount: textNodes.length } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'AI scan failed' });
+        }
+      });
+      return;
+    }
+
+    // ── POST /ai/scan-batch ──────────────────────────────────────────────────
+    // Evaluates 2-3 frames in a single Claude call to amortise the guidelines
+    // cache_miss across all frames. Used when totalChunks <= 3.
+    // Body: { frames: [{ frameName: string, textNodes: [...] }] }
+    if (req.method === 'POST' && url.pathname === '/ai/scan-batch') {
+      if (!aiTokenGuard(req, res)) return;
+      const batchChunks = [];
+      req.on('data', function(chunk) { batchChunks.push(chunk); });
+      req.on('end', async function() {
+        const body = Buffer.concat(batchChunks).toString('utf8');
+        try {
+          const { frames } = JSON.parse(body);
+          if (!Array.isArray(frames) || frames.length === 0) {
+            sendJson(res, 400, { error: 'frames array is required' }); return;
+          }
+          const cfg = loadAiConfig();
+          if (!cfg.provider) {
+            sendJson(res, 400, { error: 'AI provider not configured. Set it in plugin settings.' }); return;
+          }
+          let guidelines = '';
+          try {
+            const raw = fs.readFileSync(GUIDELINES_FILE, 'utf8');
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+            guidelines = (parsed && typeof parsed.content === 'string') ? parsed.content : raw;
+          } catch (_) {}
+          if (!guidelines.trim()) {
+            sendJson(res, 400, { error: 'No content guidelines found. Upload guidelines in plugin settings.' }); return;
+          }
+          const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
+          const resolvedGuidelines = await resolveGuidelinesUrls(guidelines);
+          const issues = await runAiContentScanBatch(cfg, model, resolvedGuidelines, frames);
+          sendJson(res, 200, { ok: true, issues, meta: { provider: cfg.provider, model, frameCount: frames.length } });
+        } catch (e) {
+          sendJson(res, 500, { error: e.message || 'Batch scan failed' });
         }
       });
       return;
@@ -2182,20 +2256,53 @@ async function requestHandler(req, res) {
         const figmaHeaders = await getFigmaAuthHeaders(req);
         const body = Buffer.concat(chunks).toString('utf8');
         try {
-          const { fileKey, nodeId, x, y, message } = JSON.parse(body);
+          const { fileKey, nodeId, x, y, offsetX, offsetY, message } = JSON.parse(body);
           if (!fileKey) { sendJson(res, 400, { error: 'fileKey is required' }); return; }
           if (!message) { sendJson(res, 400, { error: 'message is required' }); return; }
 
-          const commentBody = { message, client_meta: { x: Math.round(x || 0), y: Math.round(y || 0) } };
+          // Plugin API node IDs for instance override children use the format "I123:456;789:012;..."
+          // where "I" is a prefix and ";" separates the ancestor chain. Figma REST API only
+          // accepts a simple "123:456" node ID — strip the prefix and take the first segment.
+          let cleanNodeId = nodeId || '';
+          if (cleanNodeId.startsWith('I')) cleanNodeId = cleanNodeId.slice(1);
+          if (cleanNodeId.includes(';')) cleanNodeId = cleanNodeId.split(';')[0];
+          // The REST API uses colon form ("123:456"). Normalizing hyphens to colons repairs any
+          // mangled IDs before they reach Figma.
+          cleanNodeId = cleanNodeId.replace(/-/g, ':');
+          const restNodeId = cleanNodeId || null;
+          const figmaUrl = `https://api.figma.com/v1/files/${fileKey}/comments`;
+          // Anchor to the node when we have one — this is page-aware (Figma knows which page the
+          // node lives on). An absolute {x,y} pin has no page context and Figma drops it on the
+          // default page, which is why pinning put comments on the wrong page.
+          const pinMeta = { x: Math.round(x || 0), y: Math.round(y || 0) };
+          // node_offset positions the comment within the anchored node. For instance sublayers the
+          // plugin computes the text's offset from the instance root so the comment lands on the text.
+          const nodeOffset = { x: Math.round(offsetX || 0), y: Math.round(offsetY || 0) };
+          const client_meta = restNodeId
+            ? { node_id: restNodeId, node_offset: nodeOffset }
+            : pinMeta;
 
-          const result = await fetchJson(
-            `https://api.figma.com/v1/files/${fileKey}/comments`,
-            {
+          let result;
+          try {
+            result = await fetchJson(figmaUrl, {
               method: 'POST',
               headers: Object.assign({}, figmaHeaders, { 'Content-Type': 'application/json' }),
-              body: JSON.stringify(commentBody),
+              body: JSON.stringify({ message, client_meta }),
+            });
+          } catch (anchorErr) {
+            // Node-anchored post failed (e.g. the node isn't addressable via REST). Rather than
+            // lose the comment, retry as an absolute canvas pin using the coords the plugin captured.
+            if (restNodeId) {
+              console.warn('[Design Guardian] add-comment node-anchor failed; retrying as canvas pin:', anchorErr.message);
+              result = await fetchJson(figmaUrl, {
+                method: 'POST',
+                headers: Object.assign({}, figmaHeaders, { 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ message, client_meta: pinMeta }),
+              });
+            } else {
+              throw anchorErr;
             }
-          );
+          }
           sendJson(res, 200, { ok: true, commentId: result.id });
         } catch (e) {
           console.error('[Design Guardian] add-comment error:', e.message);
@@ -2261,12 +2368,125 @@ function stripYamlFrontmatter(text) {
   return text.slice(end + 4).replace(/^\n/, '');
 }
 
+// ── URL resolution for guidelines ────────────────────────────────────────────
+// Detects URLs in guidelines content, fetches them, and inlines the content so
+// Claude sees the actual referenced material. Direct HTTP is tried first; if it
+// fails (auth required, VPN, 4xx) the request falls back to the Claude CLI which
+// has access to any MCP connectors the user has configured (Notion, Confluence,
+// Google Drive, etc.) and can reach resources behind VPN/auth.
+
+function extractUrls(text) {
+  const seen = new Set();
+  const results = [];
+  const re = /https?:\/\/[^\s)>"'\]\\,]+/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const url = m[0].replace(/[.,;:!?]+$/, ''); // strip trailing punctuation
+    if (!seen.has(url)) { seen.add(url); results.push(url); }
+  }
+  return results;
+}
+
+function stripHtmlTags(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+async function fetchUrlDirect(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'DesignGuardian/1.0' } });
+    clearTimeout(timer);
+    if (!res.ok) {
+      console.warn('[Design Guardian] fetch-url direct HTTP ' + res.status + ' for ' + url);
+      return null;
+    }
+    const text = await res.text();
+    const ct = res.headers.get('content-type') || '';
+    const content = ct.includes('html') ? stripHtmlTags(text) : text;
+    return content.slice(0, 20000) || null;
+  } catch (err) {
+    clearTimeout(timer);
+    const reason = err.name === 'AbortError' ? 'timeout (8s)' : err.message;
+    console.warn('[Design Guardian] fetch-url direct failed (' + reason + ') for ' + url);
+    return null;
+  }
+}
+
+async function fetchUrlViaCli(url) {
+  const prompt = [
+    'Use any available tools or connectors to fetch the full text content of this URL:',
+    url,
+    '',
+    'Rules:',
+    '- Use a connector/tool to retrieve it. Do NOT make up or summarise the content.',
+    '- Return ONLY the raw text content — no markdown, no explanation, no extra commentary.',
+    '- If you cannot retrieve it for any reason, output exactly: FETCH_FAILED',
+  ].join('\n');
+  try {
+    var modelAlias = (_cliModelState && _cliModelState.useFlag) ? _cliModelState.alias : pickAnthropicCliModel();
+    var args = (_cliModelState && !_cliModelState.useFlag)
+      ? ['-p', '--output-format', 'json']
+      : ['-p', '--output-format', 'json', '--model', modelAlias];
+    const stdout = await spawnCli('claude', args, prompt);
+    const wrapper = JSON.parse(stdout);
+    const result = (wrapper.result || '').trim();
+    if (!result || /^FETCH_FAILED/i.test(result)) {
+      console.warn('[Design Guardian] fetch-url CLI returned FETCH_FAILED for ' + url);
+      return null;
+    }
+    return result.slice(0, 20000);
+  } catch (err) {
+    console.error('[Design Guardian] fetch-url CLI error for ' + url + ': ' + err.message);
+    return null;
+  }
+}
+
+// resolveGuidelinesUrls: replaces URLs found in guidelines with their fetched content,
+// so Claude sees the referenced material inline. Cached per URL for 1 hour.
+async function resolveGuidelinesUrls(content) {
+  const urls = extractUrls(content);
+  if (urls.length === 0) return content;
+
+  let result = content;
+  const now = Date.now();
+
+  for (const url of urls) {
+    const cached = _urlContentCache[url];
+    if (cached && now - cached.fetchedAt < _URL_CACHE_TTL) {
+      result = result.replace(url, url + '\n[Content from ' + url + ']:\n---\n' + cached.content + '\n---');
+      continue;
+    }
+
+    let fetched = await fetchUrlDirect(url);
+    if (!fetched) fetched = await fetchUrlViaCli(url);
+
+    if (fetched) {
+      _urlContentCache[url] = { content: fetched, fetchedAt: now };
+      result = result.replace(url, url + '\n[Content from ' + url + ']:\n---\n' + fetched + '\n---');
+    } else {
+      console.error('[Design Guardian] fetch-url all methods failed for: ' + url);
+    }
+  }
+
+  return result;
+}
+
 // ── AI provider router ────────────────────────────────────────────────────────
 // Sends text content + guidelines to the configured AI provider.
 // Returns array of { layerName, path, issue, suggestion } objects.
 async function runAiContentScan(cfg, model, guidelines, textNodes) {
   const textSummary = textNodes
-    .map(function(n) { return '- [' + n.path + '] ' + JSON.stringify(n.characters); })
+    // Each node gets a short integer ref so Claude echoes a trivially-copyable handle
+    // instead of transcribing a 60-char instance-sublayer ID. Plugin maps ref -> real node.
+    .map(function(n, i) { var ref = (n.ref === 0 || n.ref) ? n.ref : i; return '- [ref:' + ref + '] [' + n.path + '] ' + JSON.stringify(n.characters); })
     .join('\n');
 
   const persona = (cfg.persona || '').trim() || DEFAULT_AI_PERSONA;
@@ -2281,10 +2501,11 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
 
   // userPart: per-frame content + output instructions (changes each call)
   const userPart = [
-    '## Text Content from Design (format: [layer path] "text")',
+    '## Text Content from Design (format: [ref:N] [layer path] "text")',
     textSummary,
     '',
     'Return ONLY a JSON array of issues. Each issue must have:',
+    '- "ref": copy the exact integer from [ref:N] for the layer with the issue (e.g. 7). Just the number.',
     '- "layerPath": the layer path from the list above',
     '- "characters": copy the full text string for that layer exactly as it appears in the input above, character for character',
     '- "issue": ONE sentence, max 24 words. State only the violation. No conjunctions, no "also", no extra context.',
@@ -2317,6 +2538,62 @@ async function runAiContentScan(cfg, model, guidelines, textNodes) {
     return await runAiScanGoogle(cfg.apiKey, model, fullPrompt, 'content-scan');
   } else if (cfg.provider === 'ollama') {
     return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, fullPrompt, 'content-scan');
+  }
+  throw new Error('Unknown AI provider: ' + cfg.provider);
+}
+
+// runAiContentScanBatch: evaluates 2-3 frames in a single call to amortise the guidelines
+// cache_miss across all frames instead of paying it once per concurrent call.
+async function runAiContentScanBatch(cfg, model, guidelines, frames) {
+  const persona = (cfg.persona || '').trim() || DEFAULT_AI_PERSONA;
+
+  const systemPart = [
+    persona,
+    '',
+    '## Content Guidelines',
+    guidelines,
+  ].join('\n');
+
+  const framesText = frames.map(function(f) {
+    const textSummary = f.textNodes
+      .map(function(n, i) { var ref = (n.ref === 0 || n.ref) ? n.ref : i; return '  - [ref:' + ref + '] [' + n.path + '] ' + JSON.stringify(n.characters); })
+      .join('\n');
+    return '### Frame: "' + f.frameName + '"\n' + textSummary;
+  }).join('\n\n');
+
+  const userPart = [
+    '## Text Content from Design (format: [ref:N] [layer path] "text")',
+    '',
+    framesText,
+    '',
+    'Return ONLY a JSON array of issues across all frames. Each issue must have:',
+    '- "ref": copy the exact integer from [ref:N] for the layer with the issue (e.g. 7). Just the number.',
+    '- "frameName": exactly as shown in the ### Frame header above',
+    '- "layerPath": the full layer path from the list above',
+    '- "characters": copy the full text string for that layer exactly as it appears in the input',
+    '- "issue": ONE sentence, max 24 words. State only the violation.',
+    '- "suggestion": ONE sentence, max 24 words. Give the fix or an example replacement.',
+    '- "rule": 2-4 words naming the specific guideline violated.',
+    '- "severity": "error" | "warning" | "suggestion"',
+    '- "replacement": the exact corrected text only. Omit if no clean single replacement exists.',
+    '',
+    'If there are no issues, return []. Return only valid JSON, no explanation.',
+  ].join('\n');
+
+  const fullPrompt = systemPart + '\n\n' + userPart;
+  const label = 'content-scan-batch (' + frames.length + ' frames)';
+
+  if (cfg.authMethod === 'cli') {
+    return await runAiScanCLI(cfg.provider, model, fullPrompt, label);
+  }
+  if (cfg.provider === 'anthropic') {
+    return await runAiScanAnthropic(cfg.apiKey, model, userPart, systemPart, label);
+  } else if (cfg.provider === 'openai') {
+    return await runAiScanOpenAI(cfg.apiKey, model, fullPrompt, label);
+  } else if (cfg.provider === 'google') {
+    return await runAiScanGoogle(cfg.apiKey, model, fullPrompt, label);
+  } else if (cfg.provider === 'ollama') {
+    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, fullPrompt, label);
   }
   throw new Error('Unknown AI provider: ' + cfg.provider);
 }
@@ -2435,6 +2712,7 @@ function parseAiJsonResponse(text) {
 // If cacheableSystem is provided, it is sent as the system prompt with prompt caching enabled,
 // and prompt is sent as the user message. This reduces token costs on parallel frame scans.
 async function runAiScanAnthropic(apiKey, model, prompt, cacheableSystem, label) {
+  const _aiStart = Date.now();
   const reqHeaders = {
     'Content-Type': 'application/json',
     'x-api-key': apiKey,
@@ -2465,7 +2743,7 @@ async function runAiScanAnthropic(apiKey, model, prompt, cacheableSystem, label)
   const cacheRead = (usage && usage.cache_read_input_tokens) || 0;
   const cacheCreate = (usage && usage.cache_creation_input_tokens) || 0;
   const cacheInfo = (cacheRead || cacheCreate) ? (' cache_read=' + cacheRead + ' cache_write=' + cacheCreate) : '';
-  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.input_tokens || '?') + ' out=' + (usage && usage.output_tokens || '?') + cacheInfo);
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.input_tokens || '?') + ' out=' + (usage && usage.output_tokens || '?') + cacheInfo + ' elapsed=' + (Date.now() - _aiStart) + 'ms');
   if (res && res.stop_reason === 'max_tokens') throw new Error('AI response truncated (output limit reached). Try scanning fewer nodes at once.');
   const text = res && res.content && res.content[0] && res.content[0].text || '';
   return parseAiJsonResponse(text);
@@ -2473,6 +2751,7 @@ async function runAiScanAnthropic(apiKey, model, prompt, cacheableSystem, label)
 
 // runAiScanOpenAI: calls OpenAI Chat Completions API; returns parsed issues array.
 async function runAiScanOpenAI(apiKey, model, prompt, label) {
+  const _aiStart = Date.now();
   const res = await fetchJson('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
@@ -2483,7 +2762,7 @@ async function runAiScanOpenAI(apiKey, model, prompt, label) {
     }),
   }, 'OpenAI API');
   const usage = res && res.usage;
-  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.prompt_tokens || '?') + ' out=' + (usage && usage.completion_tokens || '?'));
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.prompt_tokens || '?') + ' out=' + (usage && usage.completion_tokens || '?') + ' elapsed=' + (Date.now() - _aiStart) + 'ms');
   const finishReason = res && res.choices && res.choices[0] && res.choices[0].finish_reason;
   if (finishReason === 'length') throw new Error('AI response truncated (output limit reached). Try scanning fewer nodes at once.');
   const text = res && res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content || '';
@@ -2492,6 +2771,7 @@ async function runAiScanOpenAI(apiKey, model, prompt, label) {
 
 // runAiScanGoogle: calls Google Generative Language API (Gemini); returns parsed issues array.
 async function runAiScanGoogle(apiKey, model, prompt, label) {
+  const _aiStart = Date.now();
   const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey;
   const res = await fetchJson(endpoint, {
     method: 'POST',
@@ -2499,7 +2779,7 @@ async function runAiScanGoogle(apiKey, model, prompt, label) {
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 4096 } }),
   }, 'Google AI API');
   const usage = res && res.usageMetadata;
-  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.promptTokenCount || '?') + ' out=' + (usage && usage.candidatesTokenCount || '?'));
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (usage && usage.promptTokenCount || '?') + ' out=' + (usage && usage.candidatesTokenCount || '?') + ' elapsed=' + (Date.now() - _aiStart) + 'ms');
   const finishReason = res && res.candidates && res.candidates[0] && res.candidates[0].finishReason;
   if (finishReason === 'MAX_TOKENS') throw new Error('AI response truncated (output limit reached). Try scanning fewer nodes at once.');
   const text = res && res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts && res.candidates[0].content.parts[0] && res.candidates[0].content.parts[0].text || '';
@@ -2508,6 +2788,7 @@ async function runAiScanGoogle(apiKey, model, prompt, label) {
 
 // runAiScanOllama: calls a local Ollama instance; returns parsed issues array.
 async function runAiScanOllama(endpoint, model, prompt, label) {
+  const _aiStart = Date.now();
   const res = await fetchJson(endpoint + '/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2518,7 +2799,7 @@ async function runAiScanOllama(endpoint, model, prompt, label) {
       options: { num_predict: 4096 },
     }),
   }, 'Ollama');
-  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (res && res.prompt_eval_count || '?') + ' out=' + (res && res.eval_count || '?'));
+  console.log('[Design Guardian] AI ' + (label || 'ai') + ' model=' + model + ' in=' + (res && res.prompt_eval_count || '?') + ' out=' + (res && res.eval_count || '?') + ' elapsed=' + (Date.now() - _aiStart) + 'ms');
   const text = res && res.message && res.message.content || '';
   return parseAiJsonResponse(text);
 }
@@ -2535,8 +2816,8 @@ function spawnCli(cmd, args, stdinData) {
       if (settled) return;
       settled = true;
       try { child.kill(); } catch (_) {}
-      reject(new Error(cmd + ' CLI timed out after 60s'));
-    }, 60000);
+      reject(new Error(cmd + ' CLI timed out after 240s'));
+    }, 240000);
     child.stdout.on('data', function(d) { stdout += d.toString(); });
     child.stderr.on('data', function(d) { stderr += d.toString(); });
     child.on('error', function() {
@@ -2611,34 +2892,107 @@ async function checkCliAuth(provider) {
   } catch (_) { return false; }
 }
 
+// Cost-ordered model aliases for Anthropic CLI (cheapest first).
+var ANTHROPIC_MODEL_PRIORITY = ['haiku', 'sonnet', 'opus'];
+
+// Reads availableModels from ~/.claude/settings.json and returns the cheapest allowed alias.
+// Falls back to 'haiku' when no restriction is configured.
+function pickAnthropicCliModel() {
+  try {
+    var settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+    var settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    if (Array.isArray(settings.availableModels) && settings.availableModels.length > 0) {
+      for (var i = 0; i < ANTHROPIC_MODEL_PRIORITY.length; i++) {
+        var alias = ANTHROPIC_MODEL_PRIORITY[i];
+        if (settings.availableModels.some(function(m) { return typeof m === 'string' && m.toLowerCase().includes(alias); })) {
+          return alias;
+        }
+      }
+    }
+  } catch (_) {}
+  return 'haiku';
+}
+
+// Cached CLI model state after first successful Anthropic call:
+//   null                         = not yet determined
+//   { alias, useFlag: true }     = --model <alias> accepted
+//   { alias: 'default', useFlag: false } = --model blocked; use no flag
+var _cliModelState = null;
+
 // Routes a CLI subscription scan to the correct CLI binary for the provider.
-// Prompt is passed via stdin; model is passed via --model flag where supported.
+// Anthropic: uses --output-format json for token counts; tries --model first with
+// enterprise fallback (enterprise policies block --model; server detects and retries).
 async function runAiScanCLI(provider, model, prompt, label) {
   var cliConfigs = {
-    // --bare and --no-session-persistence removed: --bare is not supported by all Claude Code
-    // versions and causes "not logged in" rejections on enterprise installs. --no-session-persistence
-    // strips enterprise SSO credentials. -p (print mode) alone is sufficient.
-    anthropic: { cmd: 'claude', args: ['-p'] },
+    // --output-format json gives token counts + cost in a wrapper object; result field has the AI text.
+    anthropic: { cmd: 'claude', args: ['-p', '--output-format', 'json'], jsonWrapper: true },
     google:    { cmd: 'gemini', args: ['-p'] },
     openai:    { cmd: 'codex',  args: ['exec', '-', '--ephemeral'] },
   };
   var cli = cliConfigs[provider];
   if (!cli) throw new Error('CLI subscription is not supported for provider: ' + provider + '. Use API Key mode instead.');
-  // Do not pass --model for CLI subscription — the CLI/enterprise account has its own
-  // configured model. Forcing a specific model ID causes failures in managed environments.
-  var args = cli.args.slice();
+
+  // For Anthropic: try to pass --model for cost optimisation; fall back if enterprise blocks it.
+  var args;
+  var modelAlias;
+  if (provider === 'anthropic' && cli.jsonWrapper) {
+    var requestedAlias = model
+      ? (/haiku/i.test(model) ? 'haiku' : /sonnet/i.test(model) ? 'sonnet' : /opus/i.test(model) ? 'opus' : model)
+      : pickAnthropicCliModel();
+    if (_cliModelState === null || _cliModelState.useFlag) {
+      modelAlias = requestedAlias;
+      args = ['-p', '--output-format', 'json', '--model', modelAlias];
+    } else {
+      modelAlias = requestedAlias;
+      args = cli.args.slice(); // enterprise: omit --model
+    }
+  } else {
+    args = cli.args.slice();
+  }
+
+  const _cliStart = Date.now();
   var stdout = await spawnCli(cli.cmd, args, prompt);
-  console.log('[Design Guardian] AI ' + (label || 'ai') + ' provider=' + provider + ' (CLI, no token count)');
+
+  var responseText = stdout;
+  if (cli.jsonWrapper) {
+    try {
+      var wrapper = JSON.parse(stdout);
+      // First call: if --model was rejected by enterprise policy, retry without it.
+      if (wrapper.is_error && _cliModelState === null) {
+        var errText = (typeof wrapper.result === 'string' ? wrapper.result : '').toLowerCase();
+        if (errText.includes('model') || errText.includes('not found') || errText.includes('not available')) {
+          console.log('[Design Guardian] --model ' + modelAlias + ' blocked by policy, retrying with default model');
+          _cliModelState = { alias: 'default', useFlag: false };
+          stdout = await spawnCli(cli.cmd, cli.args.slice(), prompt);
+          wrapper = JSON.parse(stdout);
+          modelAlias = 'default';
+        }
+      } else if (!wrapper.is_error && _cliModelState === null) {
+        _cliModelState = { alias: modelAlias, useFlag: true };
+      }
+      responseText = wrapper.result || '';
+      var u = wrapper.usage || {};
+      var cacheRead = u.cache_read_input_tokens || 0;
+      var cacheMiss = u.cache_creation_input_tokens || 0;
+      var cost = wrapper.total_cost_usd != null ? '$' + wrapper.total_cost_usd.toFixed(6) : '?';
+      console.log('[Design Guardian] AI ' + (label || 'ai') + ' provider=' + provider + ' model=' + (modelAlias || 'default') + ' (CLI) in=' + (u.input_tokens || 0) + ' cache_read=' + cacheRead + ' cache_miss=' + cacheMiss + ' out=' + (u.output_tokens || 0) + ' cost=' + cost + ' elapsed=' + (Date.now() - _cliStart) + 'ms');
+    } catch (_) {
+      console.log('[Design Guardian] AI ' + (label || 'ai') + ' provider=' + provider + ' (CLI, could not parse usage) elapsed=' + (Date.now() - _cliStart) + 'ms');
+    }
+  } else {
+    console.log('[Design Guardian] AI ' + (label || 'ai') + ' provider=' + provider + ' (CLI, no token count) elapsed=' + (Date.now() - _cliStart) + 'ms');
+  }
+
   // Only treat as an auth error if the response literally says "not logged in".
   // Avoid matching "login" broadly — AI responses about login flows would trigger false positives.
-  if (!stdout.includes('[') && (
-    stdout.toLowerCase().includes('not logged in') ||
-    stdout.toLowerCase().includes('please run /login') ||
-    stdout.toLowerCase().includes('unauthorized')
+  if (!responseText.includes('[') && (
+    responseText.toLowerCase().includes('not logged in') ||
+    responseText.toLowerCase().includes('please run /login') ||
+    responseText.toLowerCase().includes('unauthorized')
   )) {
-    throw new Error('CLI not authenticated: ' + stdout.trim() + '. Run `' + cli.cmd + '` in your terminal and use /login.');
+    throw new Error('CLI not authenticated: ' + responseText.trim() + '. Run `' + cli.cmd + '` in your terminal and use /login.');
   }
-  return parseAiJsonResponse(stdout);
+  return parseAiJsonResponse(responseText);
 }
 
 function findAvailablePort(preferred) {
