@@ -91,14 +91,14 @@ const GUIDELINES_FILE = process.env.GUIDELINES_FILE ||
 const DEFAULT_AI_PERSONA = [
   'You are a design content reviewer. Check the text content below against the provided guidelines.',
   '',
-  'SKIP these — they are Figma component scaffolding with no product meaning:',
+  'SKIP these, they are Figma component scaffolding with no product meaning:',
   '- Text that is literally a single generic word used as a UI element name: "Slot", "Text", "Checkbox", "Toggle"',
   '- Instructional Figma layer labels like "Swap me with your body component." or "Copy me -> detach me"',
   '- Pure numeric values like "20" used as counters or badges with no surrounding context',
   '',
-  'DO evaluate these — they are real product copy regardless of where they appear:',
+  'DO evaluate these, they are real product copy regardless of where they appear:',
   '- Any text a designer clearly wrote for end users: headings, descriptions, error messages, empty states, CTAs',
-  '- Button labels, even short ones — especially check capitalisation (e.g. "ACTION" should be sentence case if guidelines require it)',
+  '- Button labels, even short ones, especially check capitalisation (e.g. "ACTION" should be sentence case if guidelines require it)',
   '- Any word or phrase that is not literally the name of a UI component type',
 ].join('\n');
 
@@ -1842,6 +1842,10 @@ async function requestHandler(req, res) {
 
     // ── GET /ai/config ───────────────────────────────────────────────────────
     // Returns current AI provider config (API key masked).
+    // NOTE: pairingToken is returned here without authentication — the plugin needs it on
+    // first load for its CSRF bootstrap before it has any token to send. Acceptable for
+    // single-desk local use (server bound to 0.0.0.0 on a trusted LAN). For shared/team
+    // deployment, consider restricting the bind address to 127.0.0.1.
     if (req.method === 'GET' && url.pathname === '/ai/config') {
       const cfg = loadAiConfig();
       sendJson(res, 200, {
@@ -2052,10 +2056,78 @@ async function requestHandler(req, res) {
           } finally {
             delete _evalGuidelinesInFlight[contentHash];
           }
-          _evalGuidelinesCache[contentHash] = issues;
-          sendJson(res, 200, { ok: true, issues });
+          // Only cache non-empty results — empty arrays are indistinguishable from a parse
+          // failure and locking in [] would hide a failed call on the next request.
+          if (issues && issues.length > 0) _evalGuidelinesCache[contentHash] = issues;
+          sendJson(res, 200, { ok: true, issues: issues || [] });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'Guidelines evaluation failed' });
+        }
+      });
+      return;
+    }
+
+    // ── POST /ai/evaluate-guidelines-batch ───────────────────────────────────
+    // Evaluates multiple guidelines files in a single AI call. Saves one CLI spawn per file
+    // vs. the per-file /ai/evaluate-guidelines endpoint. Cache is still keyed per-file so
+    // changing one file does not force re-evaluation of the others.
+    // Body: { files: [{ name: string, content: string }] }
+    // Returns: { ok: true, results: { [name]: { issues: [], cached: bool } } }
+    if (req.method === 'POST' && url.pathname === '/ai/evaluate-guidelines-batch') {
+      if (!aiTokenGuard(req, res)) return;
+      const batchEvalChunks = [];
+      let batchEvalSize = 0, batchEvalTooBig = false;
+      req.on('data', function(chunk) { batchEvalSize += chunk.length; if (batchEvalSize > MAX_BODY_BYTES) { batchEvalTooBig = true; return; } batchEvalChunks.push(chunk); });
+      req.on('end', async function() {
+        if (batchEvalTooBig) { sendJson(res, 413, { error: 'Content exceeds 5 MB limit' }); return; }
+        const body = Buffer.concat(batchEvalChunks).toString('utf8');
+        try {
+          const { files } = JSON.parse(body);
+          if (!Array.isArray(files) || files.length === 0) {
+            sendJson(res, 400, { error: 'files array is required' }); return;
+          }
+          const cfg = loadAiConfig();
+          if (!cfg.provider) {
+            sendJson(res, 400, { error: 'AI provider not configured. Set it in plugin settings.' }); return;
+          }
+          const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
+
+          // Check the per-file cache first — only changed files need a new AI call.
+          const results = {};
+          const uncached = [];
+          files.forEach(function(f) {
+            if (!f.content || !f.content.trim()) return;
+            const hash = require('crypto').createHash('sha256').update(f.content).digest('hex').slice(0, 16);
+            if (_evalGuidelinesCache[hash]) {
+              results[f.name] = { issues: _evalGuidelinesCache[hash], cached: true };
+            } else {
+              uncached.push({ name: f.name, content: f.content, hash: hash });
+            }
+          });
+
+          if (uncached.length === 0) {
+            sendJson(res, 200, { ok: true, results }); return;
+          }
+
+          const rawBatch = await runAiGuidelinesEvaluationBatch(cfg, model, uncached);
+          if (Array.isArray(rawBatch)) {
+            rawBatch.forEach(function(entry) {
+              if (!entry || !entry.name) return;
+              const file = uncached.find(function(f) { return f.name === entry.name; });
+              if (!file) return;
+              const issues = Array.isArray(entry.issues) ? entry.issues : [];
+              if (issues.length > 0) _evalGuidelinesCache[file.hash] = issues;
+              results[entry.name] = { issues: issues, cached: false };
+            });
+          }
+          // Fill any files the AI didn't return (parse failure, etc.) with empty results.
+          uncached.forEach(function(f) {
+            if (!results[f.name]) results[f.name] = { issues: [], cached: false };
+          });
+
+          sendJson(res, 200, { ok: true, results });
+        } catch (e) {
+          sendJson(res, 500, { error: e.message || 'Guidelines batch evaluation failed' });
         }
       });
       return;
@@ -2167,9 +2239,9 @@ async function requestHandler(req, res) {
           }
 
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
-          const resolvedGuidelines = await resolveGuidelinesUrls(guidelines);
+          const { content: resolvedGuidelines, failedUrls } = await resolveGuidelinesUrls(guidelines);
           const issues = await runAiContentScan(cfg, model, resolvedGuidelines, textNodes);
-          sendJson(res, 200, { ok: true, issues, meta: { provider: cfg.provider, model, nodeCount: textNodes.length } });
+          sendJson(res, 200, { ok: true, issues, urlWarnings: failedUrls.length > 0 ? failedUrls : undefined, meta: { provider: cfg.provider, model, nodeCount: textNodes.length } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'AI scan failed' });
         }
@@ -2207,9 +2279,9 @@ async function requestHandler(req, res) {
             sendJson(res, 400, { error: 'No content guidelines found. Upload guidelines in plugin settings.' }); return;
           }
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
-          const resolvedGuidelines = await resolveGuidelinesUrls(guidelines);
+          const { content: resolvedGuidelines, failedUrls } = await resolveGuidelinesUrls(guidelines);
           const issues = await runAiContentScanBatch(cfg, model, resolvedGuidelines, frames);
-          sendJson(res, 200, { ok: true, issues, meta: { provider: cfg.provider, model, frameCount: frames.length } });
+          sendJson(res, 200, { ok: true, issues, urlWarnings: failedUrls.length > 0 ? failedUrls : undefined, meta: { provider: cfg.provider, model, frameCount: frames.length } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'Batch scan failed' });
         }
@@ -2451,32 +2523,40 @@ async function fetchUrlViaCli(url) {
 
 // resolveGuidelinesUrls: replaces URLs found in guidelines with their fetched content,
 // so Claude sees the referenced material inline. Cached per URL for 1 hour.
+// Returns { content: string, failedUrls: string[] } so callers can surface fetch failures.
 async function resolveGuidelinesUrls(content) {
   const urls = extractUrls(content);
-  if (urls.length === 0) return content;
+  if (urls.length === 0) return { content, failedUrls: [] };
 
-  let result = content;
   const now = Date.now();
 
-  for (const url of urls) {
+  // Fetch all URLs in parallel — each is independent.
+  const fetchResults = await Promise.all(urls.map(async function(url) {
     const cached = _urlContentCache[url];
     if (cached && now - cached.fetchedAt < _URL_CACHE_TTL) {
-      result = result.replace(url, url + '\n[Content from ' + url + ']:\n---\n' + cached.content + '\n---');
-      continue;
+      return { url, text: cached.content, failed: false };
     }
-
     let fetched = await fetchUrlDirect(url);
     if (!fetched) fetched = await fetchUrlViaCli(url);
-
     if (fetched) {
       _urlContentCache[url] = { content: fetched, fetchedAt: now };
-      result = result.replace(url, url + '\n[Content from ' + url + ']:\n---\n' + fetched + '\n---');
+      return { url, text: fetched, failed: false };
+    }
+    console.error('[Design Guardian] fetch-url all methods failed for: ' + url);
+    return { url, text: null, failed: true };
+  }));
+
+  let result = content;
+  const failedUrls = [];
+  for (var i = 0; i < fetchResults.length; i++) {
+    var r = fetchResults[i];
+    if (r.failed) {
+      failedUrls.push(r.url);
     } else {
-      console.error('[Design Guardian] fetch-url all methods failed for: ' + url);
+      result = result.replace(r.url, r.url + '\n[Content from ' + r.url + ']:\n---\n' + r.text + '\n---');
     }
   }
-
-  return result;
+  return { content: result, failedUrls };
 }
 
 // ── AI provider router ────────────────────────────────────────────────────────
@@ -2683,16 +2763,63 @@ async function runAiGuidelinesEvaluation(cfg, model, content) {
     'Return ONLY a JSON array. Return [] if no issues. No explanation.',
   ].join('\n');
 
+  const label = 'eval-guidelines (' + content.split('\n').length + ' lines)';
   if (cfg.authMethod === 'cli') {
-    return await runAiScanCLI(cfg.provider, model, prompt, 'eval-guidelines');
+    return await runAiScanCLI(cfg.provider, model, prompt, label);
   } else if (cfg.provider === 'anthropic') {
-    return await runAiScanAnthropic(cfg.apiKey, model, prompt, null, 'eval-guidelines');
+    return await runAiScanAnthropic(cfg.apiKey, model, prompt, null, label);
   } else if (cfg.provider === 'openai') {
-    return await runAiScanOpenAI(cfg.apiKey, model, prompt, 'eval-guidelines');
+    return await runAiScanOpenAI(cfg.apiKey, model, prompt, label);
   } else if (cfg.provider === 'google') {
-    return await runAiScanGoogle(cfg.apiKey, model, prompt, 'eval-guidelines');
+    return await runAiScanGoogle(cfg.apiKey, model, prompt, label);
   } else if (cfg.provider === 'ollama') {
-    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt, 'eval-guidelines');
+    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt, label);
+  }
+  throw new Error('Unknown AI provider: ' + cfg.provider);
+}
+
+// runAiGuidelinesEvaluationBatch: evaluates multiple guidelines files in a single AI call.
+// Returns an array of { name, issues } — one entry per file, in input order.
+async function runAiGuidelinesEvaluationBatch(cfg, model, files) {
+  const filesSections = files.map(function(f) {
+    return '## File: ' + JSON.stringify(f.name) + '\n' + f.content;
+  }).join('\n\n---\n\n');
+
+  const prompt = [
+    'You are a content design expert evaluating guidelines documents that will be used by an AI to review UI copy in Figma designs.',
+    '',
+    'Below are ' + files.length + ' guidelines file' + (files.length !== 1 ? 's' : '') + '. Evaluate each file independently.',
+    '',
+    filesSections,
+    '',
+    '## Your task',
+    'For each file, check for quality issues that would make AI enforcement unreliable:',
+    '0. Wrong file type — if the content is not UI copy guidelines (e.g. a workflow, code spec), return a SINGLE error with category "Wrong file type" and message "This file does not appear to contain UI copy guidelines." Do not check anything else.',
+    '1. Rules too vague to enforce — e.g., "write clearly" with no measurable criteria',
+    '2. Rules without examples — especially for terminology, casing, or tone',
+    '3. Contradicting rules — one rule says X, another says the opposite',
+    '4. Reference-style content — documents what exists instead of instructing what to flag',
+    '5. Missing major UI copy categories: tone, sentence case, CTAs/buttons, error messages, placeholder text, banned terms',
+    '',
+    'Only flag real issues. If a rule is clear and enforceable, do not flag it.',
+    'Each issue: { "severity": "error"|"warning"|"suggestion", "category": "2-4 words", "message": "max 24 words", "suggestion": "max 24 words" }',
+    '',
+    'Return ONLY a JSON array with one entry per file, in the same order as the input:',
+    '[{ "name": "<exact filename as shown in ## File header>", "issues": [...] }]',
+    'Use "issues": [] for a file with no problems. Return only valid JSON, no explanation.',
+  ].join('\n');
+
+  const label = 'eval-guidelines-batch (' + files.length + ' files)';
+  if (cfg.authMethod === 'cli') {
+    return await runAiScanCLI(cfg.provider, model, prompt, label);
+  } else if (cfg.provider === 'anthropic') {
+    return await runAiScanAnthropic(cfg.apiKey, model, prompt, null, label);
+  } else if (cfg.provider === 'openai') {
+    return await runAiScanOpenAI(cfg.apiKey, model, prompt, label);
+  } else if (cfg.provider === 'google') {
+    return await runAiScanGoogle(cfg.apiKey, model, prompt, label);
+  } else if (cfg.provider === 'ollama') {
+    return await runAiScanOllama(cfg.ollamaEndpoint || 'http://localhost:11434', model, prompt, label);
   }
   throw new Error('Unknown AI provider: ' + cfg.provider);
 }
@@ -2943,8 +3070,8 @@ async function runAiScanCLI(provider, model, prompt, label) {
       modelAlias = requestedAlias;
       args = ['-p', '--output-format', 'json', '--model', modelAlias];
     } else {
-      modelAlias = requestedAlias;
-      args = cli.args.slice(); // enterprise: omit --model
+      modelAlias = 'enterprise-default'; // --model blocked by policy; CLI uses its own locked default
+      args = cli.args.slice();
     }
   } else {
     args = cli.args.slice();
