@@ -279,13 +279,28 @@ const _evalGuidelinesInFlight = {};
 // session is the only case this needs to cover; not worth a disk cache for that.
 const _explainIssueCache = {};
 // URL content cache: keyed by URL, value = { content, fetchedAt } for a success, or
-// { failed: true, fetchedAt } for a failure. Failures get a much shorter TTL than successes —
-// long enough to stop re-paying a double fetch-attempt (direct + CLI-connector fallback) on every
-// scan within one review session, short enough to retry soon in case the underlying cause
-// (login-gated page, missing connector, transient network issue) gets fixed.
+// { failed: true, fetchedAt, consecutiveFailures } for a failure.
 const _urlContentCache = {};
 const _URL_CACHE_TTL = 60 * 60 * 1000; // 1 hour (successes)
-const _URL_FAILURE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes (failures)
+const _URL_FAILURE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes — base delay, see getFailureRetryDelayMs
+
+// getFailureRetryDelayMs: escalating backoff based on how many times IN A ROW a URL has failed
+// (reset to 0 by any success). We can't tell a genuine, permanent failure (no connector configured,
+// page deleted, requires login we'll never have) apart from a transient one (timeout, rate limit,
+// momentary outage) from a single attempt — the failure reason is free-form model text, not a
+// reliable signal to key logic off of (verified directly: the same dead URL got a different
+// human-readable reason on different runs). Repeated failure itself is the more reliable signal
+// instead: a transient issue usually clears on the very next real attempt; a genuine one keeps
+// failing attempt after attempt. So the first failure gets the original short retry (still assume
+// transient, check back soon); every consecutive failure after that pushes the retry further out,
+// capping at a day so a URL that structurally cannot succeed stops costing real money on every scan
+// indefinitely. Any success resets the count to 0, so a fixed URL (connector added, site back up)
+// is treated as fresh again rather than stuck in an escalated penalty.
+function getFailureRetryDelayMs(consecutiveFailures) {
+  if (consecutiveFailures <= 1) return _URL_FAILURE_CACHE_TTL; // 10 min
+  if (consecutiveFailures === 2) return 60 * 60 * 1000;        // 1 hour
+  return 24 * 60 * 60 * 1000;                                  // 24 hours, 3rd+ in a row
+}
 
 // _claudeCliAvailable: cached on first use so we don't spawn a failing process on every URL fetch
 // when the CLI isn't installed. null = unchecked, true/false = result. Connector access (Confluence,
@@ -2949,8 +2964,9 @@ async function fetchConfluencePage(cloudId, pageId) {
     console.log('[Design Guardian] component-page fetch cache hit (' + cloudId + '/' + pageId + '), ' + cached.content.length + ' chars');
     return cached.content;
   }
-  if (cached && cached.failed && now - cached.fetchedAt < _URL_FAILURE_CACHE_TTL) {
-    console.log('[Design Guardian] component-page fetch skipping known-failed (' + cloudId + '/' + pageId + ')');
+  if (cached && cached.failed && now - cached.fetchedAt < getFailureRetryDelayMs(cached.consecutiveFailures)) {
+    console.log('[Design Guardian] component-page fetch skipping known-failed (' + cloudId + '/' + pageId + '), fail streak=' + cached.consecutiveFailures +
+      ', retry in ' + Math.ceil((getFailureRetryDelayMs(cached.consecutiveFailures) - (now - cached.fetchedAt)) / 1000) + 's');
     return null;
   }
 
@@ -2974,8 +2990,9 @@ async function fetchConfluencePage(cloudId, pageId) {
     _urlContentCache[cacheKey] = { content: result, fetchedAt: now };
     return result;
   }
-  console.log('[Design Guardian] component-page fetch FAILED (' + cloudId + '/' + pageId + '), elapsed=' + elapsedMs + 'ms');
-  _urlContentCache[cacheKey] = { failed: true, fetchedAt: now };
+  var priorFailures = (cached && cached.failed) ? (cached.consecutiveFailures || 1) : 0;
+  console.log('[Design Guardian] component-page fetch FAILED (' + cloudId + '/' + pageId + '), elapsed=' + elapsedMs + 'ms, fail streak=' + (priorFailures + 1));
+  _urlContentCache[cacheKey] = { failed: true, fetchedAt: now, consecutiveFailures: priorFailures + 1 };
   return null;
 }
 
@@ -3038,8 +3055,9 @@ async function resolveGuidelinesUrls(content, urlScopes, detectedComponentNames)
       logFetchedContent(url, cached.content, true);
       return { url, text: cached.content, failed: false };
     }
-    if (cached && cached.failed && now - cached.fetchedAt < _URL_FAILURE_CACHE_TTL) {
-      console.log('[Design Guardian] fetch-url skipping known-failed URL (retry in ' + Math.ceil((_URL_FAILURE_CACHE_TTL - (now - cached.fetchedAt)) / 1000) + 's): ' + url);
+    if (cached && cached.failed && now - cached.fetchedAt < getFailureRetryDelayMs(cached.consecutiveFailures)) {
+      console.log('[Design Guardian] fetch-url skipping known-failed URL (fail streak=' + cached.consecutiveFailures +
+        ', retry in ' + Math.ceil((getFailureRetryDelayMs(cached.consecutiveFailures) - (now - cached.fetchedAt)) / 1000) + 's): ' + url);
       return { url, text: null, failed: true };
     }
     let fetched = await fetchUrlDirect(url);
@@ -3049,8 +3067,9 @@ async function resolveGuidelinesUrls(content, urlScopes, detectedComponentNames)
       _urlContentCache[url] = { content: fetched, fetchedAt: now };
       return { url, text: fetched, failed: false };
     }
-    console.error('[Design Guardian] fetch-url all methods failed for: ' + url);
-    _urlContentCache[url] = { failed: true, fetchedAt: now };
+    var priorFailures = (cached && cached.failed) ? (cached.consecutiveFailures || 1) : 0;
+    console.error('[Design Guardian] fetch-url all methods failed for: ' + url + ', fail streak=' + (priorFailures + 1));
+    _urlContentCache[url] = { failed: true, fetchedAt: now, consecutiveFailures: priorFailures + 1 };
     return { url, text: null, failed: true };
   }));
 
