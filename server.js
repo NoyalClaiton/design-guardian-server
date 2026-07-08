@@ -287,6 +287,20 @@ const _urlContentCache = {};
 const _URL_CACHE_TTL = 60 * 60 * 1000; // 1 hour (successes)
 const _URL_FAILURE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes (failures)
 
+// _claudeCliAvailable: cached on first use so we don't spawn a failing process on every URL fetch
+// when the CLI isn't installed. null = unchecked, true/false = result. Connector access (Confluence,
+// Notion, Google Drive, etc.) is independent of the configured AI scan provider — any user who has
+// the Claude CLI installed gets it, regardless of whether they use Anthropic, OpenAI, Gemini, or Ollama.
+var _claudeCliAvailable = null;
+async function checkClaudeCliAvailable() {
+  if (_claudeCliAvailable !== null) return _claudeCliAvailable;
+  _claudeCliAvailable = await isCliInstalled('claude');
+  if (!_claudeCliAvailable) {
+    console.log('[Design Guardian] claude CLI not found — connector-based URL fetching (Confluence, Notion, Google Drive, etc.) is disabled. This is separate from your AI scan provider. Install the Claude CLI to enable it: https://docs.anthropic.com/claude-code');
+  }
+  return _claudeCliAvailable;
+}
+
 // saveUsers: persists the in-memory user store to USERS_FILE (full replace, not append).
 function saveUsers() {
   fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
@@ -2901,6 +2915,7 @@ async function runCliToolFetch(prompt, allowedTool, label) {
 }
 
 async function fetchUrlViaCli(url) {
+  if (!await checkClaudeCliAvailable()) return null;
   const prompt = buildCliFetchPrompt(url);
   // Pre-approve ONLY the one specific read-only tool this call needs — never a blanket
   // --dangerously-skip-permissions. The URL being fetched originates from user-uploaded guidelines
@@ -2932,6 +2947,8 @@ async function fetchConfluencePage(cloudId, pageId) {
     console.log('[Design Guardian] component-page fetch skipping known-failed (' + cloudId + '/' + pageId + ')');
     return null;
   }
+
+  if (!await checkClaudeCliAvailable()) return null;
 
   const prompt = [
     'This is a Confluence page. Use your Confluence/Atlassian connector\'s page-fetch tool directly',
