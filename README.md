@@ -2,18 +2,17 @@
 
 This is the backend server for the **Design Guardian** Figma plugin.
 
-Design Guardian helps design teams check whether their Figma files follow the rules of their design system. For example, it can flag components, colors, or text styles that are not from the approved library.
+Design Guardian helps design teams check whether their Figma files follow the rules of their design system. It can flag components, colors, text styles, spacing, and radius values that are not from the approved library. It can also review text content against written guidelines using AI.
 
-This server is what powers that checking. It connects to your Figma account, pulls in your design system library data, and makes it available to the plugin.
+This server powers all of that checking. It connects to your Figma account, pulls in your design system library data, and runs AI content analysis when configured.
 
 ---
 
-## How it works
+## What the server does
 
-1. You run this server (on your own machine or a hosting platform like Railway)
-2. You give it a Figma token so it can access your Figma libraries
-3. You point the Design Guardian plugin to your server URL
-4. The plugin scans your Figma files and reports any design system violations
+- **Design system checks** — loads your Figma library components, styles, and variables so the plugin can flag rule violations (wrong components, missing text styles, unapproved color values, etc.)
+- **AI content review** — scans text nodes in your designs against a Markdown guidelines file you provide, using an AI provider of your choice (Anthropic, OpenAI, or Google)
+- **Library sync** — keeps the plugin's local cache of your design system up to date without requiring a full re-import every time
 
 ---
 
@@ -23,6 +22,7 @@ You will need:
 
 - **Node.js 20 or later** installed on your machine ([download here](https://nodejs.org))
 - A **Figma Personal Access Token** (see instructions below)
+- An **AI provider API key** if you want to use the content review feature (Anthropic, OpenAI, or Google — your choice)
 
 ---
 
@@ -92,12 +92,50 @@ Use a Figma account that has access to all the design system libraries you want 
 
 ---
 
+## Setting up AI content review
+
+The AI content review feature checks text in your Figma designs against a guidelines document you write (for example, a tone of voice guide or a content checklist).
+
+**Step 1.** Create a file called `content-guidelines.md` in the server folder and write your guidelines in plain Markdown.
+
+**Step 2.** In the Design Guardian plugin, open Settings and go to the **AI** tab. Enter your AI provider API key and select a provider (Anthropic, OpenAI, or Google). The plugin saves this to the server — no additional env vars are needed.
+
+**Step 3.** Run a scan. When the plugin detects text nodes, it will send them to the server for review against your guidelines.
+
+If you do not configure an AI provider, the content review feature is simply skipped — design system checks are unaffected.
+
+---
+
 ## Configuration
 
-| Setting | Required | Description |
+### Required
+
+| Setting | Description |
+|---|---|
+| `FIGMA_PAT` | Your Figma Personal Access Token |
+
+### Optional
+
+| Setting | Default | Description |
 |---|---|---|
-| `FIGMA_PAT` | Yes | Your Figma Personal Access Token |
-| `PORT` | No | The port the server runs on. Defaults to 3001. Hosting platforms like Railway set this automatically. |
+| `PORT` | `3001` | Port the server listens on. Hosting platforms like Railway set this automatically. |
+| `GUIDELINES_FILE` | `content-guidelines.md` | Path to your content guidelines Markdown file. |
+| `AI_CONFIG_FILE` | `ai-config.json` | Path to the AI provider config file (written by the plugin — do not edit manually). |
+| `GUIDELINES_EXTRACT_CACHE_FILE` | `guidelines-extract-cache.json` | Cache for parsed guideline rules. Speeds up repeated scans. |
+| `GUIDELINES_EVAL_CACHE_FILE` | `guidelines-eval-cache.json` | Cache for guideline quality evaluations. Survives server restarts. |
+
+### Cloud / multi-user mode (advanced)
+
+If you are deploying the server for a team where each person logs in with their own Figma account, you will also need:
+
+| Setting | Description |
+|---|---|
+| `FIGMA_CLIENT_ID` | OAuth app client ID from the Figma developer settings |
+| `FIGMA_CLIENT_SECRET` | OAuth app client secret |
+| `JWT_SECRET` | A long random string used to sign session tokens |
+| `TOKEN_ENCRYPTION_KEY` | A 64-character hex string used to encrypt stored Figma tokens |
+
+Single-user setups (one `FIGMA_PAT` for one person or a shared team account) do not need these.
 
 ---
 
