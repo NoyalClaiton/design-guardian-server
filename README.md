@@ -124,6 +124,19 @@ The AI content review feature checks text in your Figma designs against a guidel
 
 If no AI provider is configured the content review step is skipped — design system checks are unaffected.
 
+### Referencing external sources in your guidelines
+
+If your guidelines link to external pages — Confluence docs, Notion pages, Google Drive, or any other URL — the server will fetch and inline the content automatically so the AI sees the actual material, not just the link. Public pages are fetched directly. For login-gated or internal pages, the server falls back to the Claude CLI using whatever MCP connectors you have enabled in your Claude account.
+
+> **Confluence** gets dedicated handling: the server extracts the `cloudId` and `pageId` directly from the URL and calls the Atlassian connector rather than guessing. This means Confluence pages load reliably even when generic URL fetching would fail.
+
+To use this with auth-gated sources:
+1. Make sure the `claude` CLI is installed and signed in on the machine running the server (see the "Use my existing subscription" steps above — this is required even if you use a different AI provider for the content scan itself)
+2. In your Claude account, enable the connectors for the sources your guidelines reference (e.g. the Atlassian connector for Confluence, the Google Drive connector for Docs)
+3. Include the full page URL in your guidelines file — the server picks it up automatically
+
+If a page can't be fetched (missing connector, access not granted), the server skips that URL and the scan continues without it. Failed fetches are retried after 10 minutes in case the connector is added in the meantime.
+
 ---
 
 ## Configuration
