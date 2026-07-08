@@ -2397,12 +2397,16 @@ async function requestHandler(req, res) {
 
           // Step 2: resolve inline URLs and fetch component Confluence pages — independent of each
           // other, both depend only on `extracted`, so they run in parallel.
-          const [urlResult, appendix] = await Promise.all([
+          const [urlResult, pagesResult] = await Promise.all([
             resolveGuidelinesUrls(guidelines, extracted && extracted.urlScopes, detectedComponentNames),
             fetchComponentPagesAppendix(extracted, textNodes),
           ]);
-          const { content: resolvedGuidelines, failedUrls, fetchedUrls } = urlResult;
-          const augmentedGuidelines = appendix ? resolvedGuidelines + '\n\n## Additional component-specific guideline pages\n' + appendix : resolvedGuidelines;
+          const { content: resolvedGuidelines } = urlResult;
+          const augmentedGuidelines = pagesResult.text ? resolvedGuidelines + '\n\n## Additional component-specific guideline pages\n' + pagesResult.text : resolvedGuidelines;
+          // Report generic-resolver URLs AND component-page fetches together, so the plugin's
+          // "External sources" card shows every source it tried — passed and failed.
+          const fetchedUrls = urlResult.fetchedUrls.concat(pagesResult.fetchedUrls);
+          const failedUrls = urlResult.failedUrls.concat(pagesResult.failedUrls);
 
           // Step 3: AI scan with fully-assembled guidelines.
           const issues = await runAiContentScan(cfg, model, augmentedGuidelines, textNodes, guidelinesFiles, guidelinesManual);
@@ -2461,12 +2465,14 @@ async function requestHandler(req, res) {
           const extracted = await extractGuidelineRules(cfg, model, guidelines);
 
           // Step 2: resolve inline URLs and fetch component Confluence pages in parallel.
-          const [urlResult, appendix] = await Promise.all([
+          const [urlResult, pagesResult] = await Promise.all([
             resolveGuidelinesUrls(guidelines, extracted && extracted.urlScopes, detectedComponentNames),
             fetchComponentPagesAppendix(extracted, _allNodes),
           ]);
-          const { content: resolvedGuidelines, failedUrls, fetchedUrls } = urlResult;
-          const augmentedGuidelines = appendix ? resolvedGuidelines + '\n\n## Additional component-specific guideline pages\n' + appendix : resolvedGuidelines;
+          const { content: resolvedGuidelines } = urlResult;
+          const augmentedGuidelines = pagesResult.text ? resolvedGuidelines + '\n\n## Additional component-specific guideline pages\n' + pagesResult.text : resolvedGuidelines;
+          const fetchedUrls = urlResult.fetchedUrls.concat(pagesResult.fetchedUrls);
+          const failedUrls = urlResult.failedUrls.concat(pagesResult.failedUrls);
 
           // Step 3: AI scan with fully-assembled guidelines.
           const issues = await runAiContentScanBatch(cfg, model, augmentedGuidelines, frames, guidelinesFiles, guidelinesManual);
@@ -3201,7 +3207,7 @@ async function fetchComponentPagesAppendix(extracted, textNodes) {
   if (unconfirmedNames.length) {
     console.log('[Design Guardian] skipping component-page fetch for unconfirmed match(es): ' + unconfirmedNames.join(', '));
   }
-  if (!extracted || confirmedComponentNames.length === 0) return '';
+  if (!extracted || confirmedComponentNames.length === 0) return { text: '', fetchedUrls: [], failedUrls: [] };
 
   // Fire all per-component Confluence fetches in parallel — they're fully independent (different
   // pages, nothing shared but the cache object, which is a safe plain-object write under Node's
@@ -3222,13 +3228,27 @@ async function fetchComponentPagesAppendix(extracted, textNodes) {
   const pageResults = await Promise.all(pageFetches);
 
   const appendix = [];
+  // Report the component pages this scan actually fetched (and the ones that failed) so the
+  // plugin's "External sources in guidelines" card can show them alongside the generic URLs.
+  // Before, only resolveGuidelinesUrls's generic links were reported — so a scan whose only
+  // successful fetches were Confluence component pages showed nothing under "passed," and a failed
+  // component page (e.g. Card) never surfaced at all. Reconstruct a Confluence page URL per entry
+  // so it renders consistently with the generic ones. A pageRef-less entry ("no page to fetch")
+  // isn't a fetch at all, so it counts as neither passed nor failed.
+  const fetchedUrls = [];
+  const failedUrls = [];
   pageResults.forEach(function(r) {
+    var pageRef = extracted.componentPages[r.name];
+    if (!pageRef || !pageRef.cloudId || !pageRef.pageId) return;
+    var pageUrl = 'https://' + pageRef.cloudId + '/wiki/pages/' + pageRef.pageId;
     if (r.content) {
-      var pageRef = extracted.componentPages[r.name];
       appendix.push('', 'Full guideline page for "' + r.name + '" (' + pageRef.cloudId + '/' + pageRef.pageId + '):', r.content);
+      fetchedUrls.push(pageUrl);
+    } else {
+      failedUrls.push(pageUrl);
     }
   });
-  return appendix.length ? appendix.join('\n') : '';
+  return { text: appendix.length ? appendix.join('\n') : '', fetchedUrls: fetchedUrls, failedUrls: failedUrls };
 }
 
 // componentTagFor: builds the "(component: X)"/"(component: X, unconfirmed match)" suffix for one
@@ -3324,13 +3344,24 @@ async function checkCompletenessAndRetry(allNodesWithRef, firstPass, retryPass, 
 // still be real, just mis-cited — it marks it (citationVerified) so that's visible instead of the
 // citation being trusted blindly. Whitespace is normalized on both sides so a quote that merely
 // spans a line break in the source document doesn't fail on a technicality.
-// normalizeForCitationCheck: strips markdown emphasis syntax before comparing. Verified directly:
-// a guidelines doc had "**Ampersands:** Only use..." and the model quoted "Ampersands: Only
-// use..." — the ONLY difference was the literal ** characters, which is exactly what you'd want a
-// citation to do (nobody wants a quote that includes raw markdown asterisks). Applied to both sides
-// so it's symmetric regardless of which one happens to carry the formatting.
+// normalizeForCitationCheck: folds away the COSMETIC differences that make a genuine citation fail
+// an exact-substring check, so verification tracks meaning, not punctuation. Applied to both sides.
+// Verified directly, twice, on the same rule:
+//   1. Source had "**Ampersands:**", model quoted "Ampersands:" — markdown asterisks. (fixed first)
+//   2. Source had  Use "and" instead.  (double quotes), model quoted  Use 'and' instead.  (single) —
+//      the model re-punctuated the quote, so a straight substring miss flagged a real citation as
+//      "unverified" (the persistent "ampersand hallucination"). So we now also fold ALL quote
+//      characters (straight/curly, single/double, backtick) to nothing and normalize dash variants
+//      (en/em → hyphen), which is the same class of cosmetic drift.
+// This only ever makes matching MORE lenient about punctuation — it can't turn a genuinely different
+// quote into a false match, because the words themselves still have to line up.
 function normalizeForCitationCheck(text) {
-  return String(text).replace(/\*+/g, '').replace(/\s+/g, ' ').trim();
+  return String(text)
+    .replace(/\*+/g, '')                 // markdown emphasis
+    .replace(/[‘’“”"'`]/g, '') // all quote chars (curly + straight, single + double, backtick)
+    .replace(/[–—]/g, '-')      // en/em dash → hyphen
+    .replace(/\s+/g, ' ')                 // collapse whitespace (incl. line breaks)
+    .trim();
 }
 
 // resolveActualSourceFile: deterministically finds which individual guidelines file (or the
