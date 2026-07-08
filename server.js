@@ -2478,19 +2478,25 @@ async function requestHandler(req, res) {
       if (!aiTokenGuard(req, res)) return;
       const normChunks = [];
       req.on('data', function(chunk) { normChunks.push(chunk); });
-      req.on('end', async function() {
+      req.on('end', function() {
+      // Wrapped in the per-request cost store (like /ai/scan) so this call's cost is captured and
+      // returned in meta — normalize is a real AI call the scan triggers, so the plugin's "AI cost"
+      // stat must include it rather than silently omitting it.
+      _requestCostStore.run({ costUsd: 0, costUnknown: false, calls: 0 }, async function() {
         try {
           const body = JSON.parse(Buffer.concat(normChunks).toString('utf8'));
           const issues = Array.isArray(body.issues) ? body.issues : [];
-          if (issues.length === 0) { sendJson(res, 200, { ok: true, issues: [] }); return; }
+          if (issues.length === 0) { sendJson(res, 200, { ok: true, issues: [], meta: { totalCostUsd: 0, aiCalls: 0 } }); return; }
           const cfg = loadAiConfig();
           if (!cfg.provider) { sendJson(res, 400, { error: 'AI provider not configured' }); return; }
           const model = cfg.model || AI_DEFAULT_MODELS[cfg.provider] || '';
           const normalized = await runAiNormalizationPass(cfg, model, issues);
-          sendJson(res, 200, { ok: true, issues: normalized });
+          const _reqCost = _requestCostStore.getStore() || { costUsd: 0, calls: 0 };
+          sendJson(res, 200, { ok: true, issues: normalized, meta: { totalCostUsd: _reqCost.costUsd, aiCalls: _reqCost.calls } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'Normalization failed' });
         }
+      });
       });
       return;
     }
@@ -2506,7 +2512,11 @@ async function requestHandler(req, res) {
       if (!aiTokenGuard(req, res)) return;
       const explainChunks = [];
       req.on('data', function(chunk) { explainChunks.push(chunk); });
-      req.on('end', async function() {
+      req.on('end', function() {
+      // Per-request cost store (like /ai/scan and /ai/normalize) so this on-demand call's cost is
+      // captured and returned in meta. A cache hit returns before any callAiProvider call, so the
+      // store stays 0 — the plugin then correctly adds $0 for a repeat click on the same issue.
+      _requestCostStore.run({ costUsd: 0, costUnknown: false, calls: 0 }, async function() {
         try {
           const body = JSON.parse(Buffer.concat(explainChunks).toString('utf8'));
           const characters = String(body.characters || '').slice(0, 2000);
@@ -2535,7 +2545,7 @@ async function requestHandler(req, res) {
           const optionsKeyPart = suggestionOptions.map(function(o) { return o.label + ':' + o.text; }).join('|');
           const cacheKey = crypto.createHash('sha256').update(characters + '|' + issueText + '|' + guidelineQuote + '|' + suggestion + '|' + optionsKeyPart).digest('hex');
           const cached = _explainIssueCache[cacheKey];
-          if (cached) { sendJson(res, 200, { ok: true, reasoning: cached, cached: true }); return; }
+          if (cached) { sendJson(res, 200, { ok: true, reasoning: cached, cached: true, meta: { totalCostUsd: 0, aiCalls: 0 } }); return; }
 
           const prompt = suggestionOptions.length > 0
             ? [
@@ -2573,14 +2583,16 @@ async function requestHandler(req, res) {
               ].join('\n');
 
           const result = await callAiProvider(cfg, model, prompt, null, 'explain-issue');
-          const obj = Array.isArray(result) ? result[0] : null;
+          const obj = unwrapAiObject(result);
           const reasoning = (obj && typeof obj.reasoning === 'string') ? obj.reasoning.trim() : '';
           if (!reasoning) { sendJson(res, 500, { error: 'Could not generate an explanation' }); return; }
           _explainIssueCache[cacheKey] = reasoning;
-          sendJson(res, 200, { ok: true, reasoning: reasoning, cached: false });
+          var _reqCost = _requestCostStore.getStore() || { costUsd: 0, calls: 0 };
+          sendJson(res, 200, { ok: true, reasoning: reasoning, cached: false, meta: { totalCostUsd: _reqCost.costUsd, aiCalls: _reqCost.calls } });
         } catch (e) {
           sendJson(res, 500, { error: e.message || 'Explain failed' });
         }
+      });
       });
       return;
     }
@@ -2794,7 +2806,7 @@ function buildCliFetchPrompt(url) {
       'Rules:',
       '- Return ONLY the page body content as plain text — no markdown formatting, no explanation, no extra commentary.',
       '- Do NOT make up or summarise the content.',
-      '- If the tool call fails or the page cannot be found, your ENTIRE response must be exactly the literal text FETCH_FAILED and nothing else — no explanation of why, even briefly. Any other text in your response, even one extra sentence, is treated as a successful fetch and gets spliced into a real document, so partial compliance is worse than none.',
+      '- If the tool call fails or the page cannot be found, your response MUST BEGIN with the literal text FETCH_FAILED. You may then add a colon and a SHORT reason for our diagnostic logs — e.g. "FETCH_FAILED: page not found", "FETCH_FAILED: permission denied", "FETCH_FAILED: page has no body content", "FETCH_FAILED: tool returned an error". The FETCH_FAILED marker MUST come first and MUST be present on any failure. On SUCCESS (you got real page content) do NOT include the word FETCH_FAILED anywhere — return only the page body.',
     ].join('\n');
   }
   return [
@@ -2804,7 +2816,7 @@ function buildCliFetchPrompt(url) {
     'Rules:',
     '- Use a connector/tool to retrieve it. Do NOT make up or summarise the content.',
     '- Return ONLY the raw text content — no markdown, no explanation, no extra commentary.',
-    '- If you cannot retrieve it for any reason, your ENTIRE response must be exactly the literal text FETCH_FAILED and nothing else — no explanation of why, even briefly. Any other text in your response, even one extra sentence, is treated as a successful fetch and gets spliced into a real document, so partial compliance is worse than none.',
+    '- If you cannot retrieve it for any reason, your response MUST BEGIN with the literal text FETCH_FAILED. You may then add a colon and a SHORT reason for our diagnostic logs — e.g. "FETCH_FAILED: page not found", "FETCH_FAILED: permission denied", "FETCH_FAILED: empty content". The FETCH_FAILED marker MUST come first and MUST be present on any failure. On SUCCESS do NOT include the word FETCH_FAILED anywhere — return only the fetched content.',
   ].join('\n');
 }
 
@@ -3116,7 +3128,7 @@ async function extractGuidelineRules(cfg, model, guidelines) {
 
   try {
     const result = await callAiProvider(cfg, model, prompt, null, 'extract-guideline-rules', 480000);
-    const obj = Array.isArray(result) ? result[0] : null;
+    const obj = unwrapAiObject(result);
     const rules = (obj && typeof obj === 'object')
       ? {
           componentPages: (obj.componentPages && typeof obj.componentPages === 'object') ? obj.componentPages : {},
@@ -3227,6 +3239,19 @@ function componentTagFor(n) {
 // Only a ref with neither an issue NOR a reviewedRefs entry is genuinely ambiguous (reviewed-and-
 // clean vs. silently-skipped look identical) — this narrows retries/synthetic issues to only that
 // truly ambiguous set instead of everything the model forgot to enumerate.
+// unwrapAiObject: every single-object prompt asks for "a JSON array containing exactly one
+// object" ([{...}]), but models intermittently drop the array wrapper and return the bare
+// object ({...}) — same data, one missing bracket. Verified directly (July 7 2026 log): a
+// content scan of 48 nodes returned a complete, valid bare object TWICE (first pass and
+// retry), and the old inline `Array.isArray(result) ? result[0] : null` discarded both paid
+// responses, tagging all 48 layers "manual review". The retry can never save this case — it
+// resends the identical prompt to the identical model, which repeats the identical format
+// quirk. Accept both shapes instead: the content is what matters, not the wrapper.
+function unwrapAiObject(result) {
+  if (Array.isArray(result)) return (result[0] && typeof result[0] === 'object') ? result[0] : null;
+  return (result && typeof result === 'object') ? result : null;
+}
+
 function collectReviewedRefs(pass) {
   var reviewed = new Set();
   // Coerce to Number here too, symmetric with the issues loop below — allRefs (from the client) are
@@ -3427,7 +3452,7 @@ async function runAiContentScan(cfg, model, guidelines, textNodes, guidelinesFil
   async function runPass(nodes) {
     var built = buildPrompt(nodes);
     var result = await callAiProvider(cfg, model, built.userPart, built.systemPart, 'content-scan');
-    var obj = Array.isArray(result) ? result[0] : null;
+    var obj = unwrapAiObject(result);
     return {
       issues: (obj && Array.isArray(obj.issues)) ? obj.issues : [],
       reviewedRefs: (obj && Array.isArray(obj.reviewedRefs)) ? obj.reviewedRefs : [],
@@ -3527,7 +3552,7 @@ async function runAiContentScanBatch(cfg, model, guidelines, frames, guidelinesF
     var built = buildPrompt(nodes);
     var label = 'content-scan-batch (' + frames.length + ' frames)';
     var result = await callAiProvider(cfg, model, built.userPart, built.systemPart, label);
-    var obj = Array.isArray(result) ? result[0] : null;
+    var obj = unwrapAiObject(result);
     return {
       issues: (obj && Array.isArray(obj.issues)) ? obj.issues : [],
       reviewedRefs: (obj && Array.isArray(obj.reviewedRefs)) ? obj.reviewedRefs : [],
@@ -3794,6 +3819,20 @@ function parseAiJsonResponse(text, label) {
     if (r5.ok) {
       console.log('[Design Guardian] ' + (label || 'ai') + ': JSON recovered by repairing an unescaped quote — avoided a retry');
       return r5.value;
+    }
+  }
+
+  // Strategy 6: bare-object equivalents of strategies 3+5. Models intermittently drop the
+  // requested [ ] wrapper and return { ... } (see unwrapAiObject) — when that response also has
+  // commentary around it (no code fence, not clean), none of the array-hunting strategies above
+  // can find it. Greedy first-'{' to last-'}' span, then the same quote-repair pass on it.
+  var greedyObj = text.match(/\{[\s\S]*\}/);
+  if (greedyObj) {
+    var r6 = tryParse(greedyObj[0]);
+    if (!r6.ok) r6 = tryParse(repairUnescapedQuotes(greedyObj[0]));
+    if (r6.ok) {
+      console.log('[Design Guardian] ' + (label || 'ai') + ': JSON recovered as a bare object (model dropped the array wrapper) — avoided a retry');
+      return r6.value;
     }
   }
 
