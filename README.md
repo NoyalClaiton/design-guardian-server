@@ -113,9 +113,12 @@ The AI content review feature checks text in your Figma designs against a guidel
 **Step 1.** Create a file called `content-guidelines.md` in the server folder and write your guidelines in plain Markdown. The server reads this file on startup.
 
 **Step 2.** In the Design Guardian plugin, open Settings and go to the **AI** tab. Select a provider (Anthropic, OpenAI, or Google) and choose how to connect:
-- **Use my existing subscription** (default) — authenticates through the Claude, Codex, or Gemini CLI installed on the server machine. No API key needed.
-- **API Key** — enter a key from your provider account for pay-as-you-go usage.
-- **Ollama** — runs a local model (Llama, Mistral, Phi, etc.) with no external service or account.
+- **Use my existing subscription** (default) — the server calls the provider's CLI on your machine and routes requests through your existing account. No API key needed, but the CLI must be installed and signed in on the machine running the server:
+  - Anthropic: install the [Claude CLI](https://docs.anthropic.com/claude-code), then run `claude auth login`
+  - OpenAI: install [Codex CLI](https://github.com/openai/codex), then run `codex login`
+  - Google: install [Gemini CLI](https://ai.google.dev/gemini-api/docs/gemini-cli), then open `gemini` and sign in
+- **API Key** — enter a key from your provider account for pay-as-you-go usage. No CLI required.
+- **Ollama** — runs a local model (Llama, Mistral, Phi, etc.) with no external service, account, or CLI.
 
 **Step 3.** Run a scan. When the plugin detects text nodes, it sends them to the server for review against your guidelines. Issues include a plain-language suggestion, and many can be auto-applied in one click.
 
