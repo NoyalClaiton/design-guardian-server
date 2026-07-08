@@ -126,16 +126,20 @@ If no AI provider is configured the content review step is skipped — design sy
 
 ### Referencing external sources in your guidelines
 
-If your guidelines link to external pages — Confluence docs, Notion pages, Google Drive, or any other URL — the server will fetch and inline the content automatically so the AI sees the actual material, not just the link. Public pages are fetched directly. For login-gated or internal pages, the server falls back to the Claude CLI using whatever MCP connectors you have enabled in your Claude account.
+If your guidelines link to external pages — Confluence docs, Notion pages, Google Drive, or any other URL — the server fetches and inlines the content automatically so the AI sees the actual material, not just the link.
 
-> **Confluence** gets dedicated handling: the server extracts the `cloudId` and `pageId` directly from the URL and calls the Atlassian connector rather than guessing. This means Confluence pages load reliably even when generic URL fetching would fail.
+**Public pages** are fetched directly over HTTP. No CLI or connector required.
 
-To use this with auth-gated sources:
-1. Make sure the `claude` CLI is installed and signed in on the machine running the server (see the "Use my existing subscription" steps above — this is required even if you use a different AI provider for the content scan itself)
-2. In your Claude account, enable the connectors for the sources your guidelines reference (e.g. the Atlassian connector for Confluence, the Google Drive connector for Docs)
-3. Include the full page URL in your guidelines file — the server picks it up automatically
+**Login-gated or internal pages** (Confluence, pages behind a VPN or SSO) can't be fetched directly. For these, the server falls back to the Claude CLI and uses whatever MCP connectors you have enabled in your Claude account. This fallback is Claude-specific because MCP connectors (Atlassian, Notion, Google Drive, etc.) are part of the Claude ecosystem — they don't exist in the Codex or Gemini CLIs. This has nothing to do with which AI provider you chose for the content scan itself; it only applies to fetching the source material.
 
-If a page can't be fetched (missing connector, access not granted), the server skips that URL and the scan continues without it. Failed fetches are retried after 10 minutes in case the connector is added in the meantime.
+> **Confluence** gets dedicated handling: the server extracts `cloudId` and `pageId` directly from the URL and calls the Atlassian connector with explicit parameters, rather than leaving the model to figure out the URL shape. This makes Confluence page fetches reliable where generic URL fetching would often fail.
+
+To use this with login-gated sources:
+1. Install and sign in to the `claude` CLI on the machine running the server (same steps as the "Use my existing subscription" section above)
+2. In your Claude account, enable the connectors for the sources your guidelines reference — for example, the Atlassian connector for Confluence
+3. Include the full page URL in your guidelines file — the server picks it up automatically on the next scan
+
+If a page can't be fetched (connector not enabled, access not granted), the server skips that URL and the scan continues without it. Failed URLs are retried after 10 minutes.
 
 ---
 
