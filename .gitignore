@@ -3,4 +3,5 @@ node_modules/
 users.json
 *.pem
 *.db
+package-lock.json
 .DS_Store
