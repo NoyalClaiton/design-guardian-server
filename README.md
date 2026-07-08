@@ -130,16 +130,18 @@ If your guidelines link to external pages — Confluence docs, Notion pages, Goo
 
 **Public pages** are fetched directly over HTTP. No CLI or connector required.
 
-**Login-gated or internal pages** (Confluence, pages behind a VPN or SSO) can't be fetched directly. For these, the server falls back to the Claude CLI and uses whatever MCP connectors you have enabled in your Claude account. This fallback is Claude-specific because MCP connectors (Atlassian, Notion, Google Drive, etc.) are part of the Claude ecosystem — they don't exist in the Codex or Gemini CLIs. This has nothing to do with which AI provider you chose for the content scan itself; it only applies to fetching the source material.
+**Login-gated or internal pages** (Confluence, pages behind a VPN or SSO) can't be fetched directly. For these, the server falls back to the Claude CLI and uses whatever MCP connectors you have enabled in your Claude account. MCP connectors (Atlassian, Notion, Google Drive, etc.) are part of the Claude ecosystem, which is why the Claude CLI is used for this step specifically.
 
-> **Confluence** gets dedicated handling: the server extracts `cloudId` and `pageId` directly from the URL and calls the Atlassian connector with explicit parameters, rather than leaving the model to figure out the URL shape. This makes Confluence page fetches reliable where generic URL fetching would often fail.
+This is **independent of your AI scan provider**. You can use OpenAI, Gemini, or Ollama for the content scan and still get full connector access for URL fetching, as long as the Claude CLI is installed on the server machine. The two are completely separate.
+
+> **Confluence** gets dedicated handling: the server extracts `cloudId` and `pageId` directly from the URL and calls the Atlassian connector with explicit parameters. This makes Confluence fetches reliable where generic URL fetching would often fail.
 
 To use this with login-gated sources:
-1. Install and sign in to the `claude` CLI on the machine running the server (same steps as the "Use my existing subscription" section above)
+1. Install and sign in to the `claude` CLI on the machine running the server — this is the only step that requires it, and it is separate from your AI scan provider choice
 2. In your Claude account, enable the connectors for the sources your guidelines reference — for example, the Atlassian connector for Confluence
-3. Include the full page URL in your guidelines file — the server picks it up automatically on the next scan
+3. Include the full page URL in your guidelines file — the server picks it up automatically
 
-If a page can't be fetched (connector not enabled, access not granted), the server skips that URL and the scan continues without it. Failed URLs are retried after 10 minutes.
+If the Claude CLI is not installed, connector-based fetching is skipped cleanly and the scan continues with direct HTTP only. If a page can't be fetched (connector not enabled, access not granted), that URL is skipped and retried after 10 minutes.
 
 ---
 
