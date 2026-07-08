@@ -36,7 +36,7 @@ Connect the plugin directly to the hosted server at `https://design-guardian-ser
 
 ### Setup
 
-**Step 1.** Download and extract the server. Either use the download button in the plugin, or download the [v1.2.21 release](https://github.com/NoyalClaiton/design-guardian-server/releases/tag/v1.2.21) directly from GitHub. Then open a terminal inside the extracted folder.
+**Step 1.** Download and extract the server. Either use the download button in the plugin, or download the [v1.2.22 release](https://github.com/NoyalClaiton/design-guardian-server/releases/tag/v1.2.22) directly from GitHub. Then open a terminal inside the extracted folder.
 
 **Step 2.** Create a `.env` file and add your Figma token:
 
