@@ -106,13 +106,18 @@ Use a Figma account that has access to all the design system libraries you want 
 
 ## Setting up AI content review
 
-The AI content review feature checks text in your Figma designs against a guidelines document you write (for example, a tone of voice guide or writing style checklist).
+The AI content review feature checks text in your Figma designs against a guidelines document you write (for example, a tone of voice guide, writing style checklist, or banned terms list).
+
+**No new subscription required.** If you already use Claude, ChatGPT, or Gemini, the plugin can authenticate through your existing account via the installed CLI — no API key needed. You can also bring your own API key if you prefer pay-as-you-go, or run a local model via Ollama with no external service at all.
 
 **Step 1.** Create a file called `content-guidelines.md` in the server folder and write your guidelines in plain Markdown. The server reads this file on startup.
 
-**Step 2.** In the Design Guardian plugin, open Settings and go to the **AI** tab. Enter your AI provider API key and select a provider (Anthropic, OpenAI, or Google). The plugin saves this configuration to the server.
+**Step 2.** In the Design Guardian plugin, open Settings and go to the **AI** tab. Select a provider (Anthropic, OpenAI, or Google) and choose how to connect:
+- **Use my existing subscription** (default) — authenticates through the Claude, Codex, or Gemini CLI installed on the server machine. No API key needed.
+- **API Key** — enter a key from your provider account for pay-as-you-go usage.
+- **Ollama** — runs a local model (Llama, Mistral, Phi, etc.) with no external service or account.
 
-**Step 3.** Run a scan. When the plugin detects text nodes, it sends them to the server for review against your guidelines.
+**Step 3.** Run a scan. When the plugin detects text nodes, it sends them to the server for review against your guidelines. Issues include a plain-language suggestion, and many can be auto-applied in one click.
 
 If no AI provider is configured the content review step is skipped — design system checks are unaffected.
 
