@@ -2,9 +2,9 @@
 
 This is the backend server for the **Design Guardian** Figma plugin.
 
-Design Guardian checks Figma files against your design system rules — flagging unapproved components, missing text styles, wrong color values, spacing and radius violations, and more. It can also review copy against written content guidelines using AI.
+Design Guardian is a pre-handoff readiness tool for Figma. In a single scan it checks design system compliance (components, tokens, and styles against your libraries), UX fundamentals (accessibility, spacing, naming), and copy quality (text nodes reviewed against your content guidelines using AI). Issues come with suggested fixes, and many can be applied in one click.
 
-This server is what powers those checks. It connects to your Figma libraries, runs AI analysis when configured, and responds to requests from the plugin.
+This server enables two of those three surfaces. It syncs your Figma library data so the plugin can run design system compliance checks, and it runs AI content review when an AI provider is configured. UX fundamentals checks run client-side in the plugin and do not require this server.
 
 ---
 
