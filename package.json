@@ -1,6 +1,6 @@
 {
   "name": "design-guardian-server",
-  "version": "1.0.0",
+  "version": "1.2.21",
   "description": "Design Guardian self-hosted server",
   "main": "server.js",
   "scripts": {
