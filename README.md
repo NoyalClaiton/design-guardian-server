@@ -26,6 +26,8 @@ Connect the plugin directly to the hosted server at `https://design-guardian-ser
 
 > **Tip:** If you have the Design Guardian plugin open in Figma, go to Settings and click **Set up self-hosted**. The plugin walks you through each step and has a download button that fetches the correct version automatically. You only need this README if you prefer to set up manually.
 
+> **Video walkthrough:** A step-by-step setup video is available on the [v1.2.22 release page](https://github.com/NoyalClaiton/design-guardian-server/releases/tag/v1.2.22).
+
 ### What you need
 
 - **Node.js 20 or later** ([download here](https://nodejs.org))
